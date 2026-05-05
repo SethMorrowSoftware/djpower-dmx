@@ -81,8 +81,11 @@ class Config:
     # Timing
     SCENE_B_DURATION = 10.0  # seconds
 
-    # GPIO debounce - ignore transitions within this window
+    # GPIO debounce - cooldown between consecutive triggers
     DEBOUNCE_TIME = 0.3  # seconds
+    # Contact must remain closed continuously for this long before triggering
+    # (filters out interference / transient signals)
+    TRIGGER_HOLD_TIME = 0.8  # seconds
 
     # DJPOWER H-IP20V Fog Machine (16-channel mode)
     # Full channel map:
@@ -1016,6 +1019,7 @@ def _gpio_monitor():
     last_state = None
     last_safety_state = None
     last_trigger_time = 0.0
+    contact_closed_since = None
     consecutive_errors = 0
     max_errors_before_reinit = 3
 
@@ -1025,6 +1029,7 @@ def _gpio_monitor():
                 if init_gpio():
                     print("GPIO initialized from monitor thread")
                     last_state = None
+                    contact_closed_since = None
                 else:
                     time.sleep(5.0)
                     continue
@@ -1043,10 +1048,17 @@ def _gpio_monitor():
 
             if current_state is not None:
                 now = time.monotonic()
-                if (last_state == 1 and current_state == 0
-                        and (now - last_trigger_time) >= config.DEBOUNCE_TIME):
-                    last_trigger_time = now
-                    trigger_sequence()
+                if current_state == 0:
+                    if last_state != 0:
+                        contact_closed_since = now
+                    elif (contact_closed_since is not None
+                            and (now - contact_closed_since) >= config.TRIGGER_HOLD_TIME
+                            and (now - last_trigger_time) >= config.DEBOUNCE_TIME):
+                        last_trigger_time = now
+                        contact_closed_since = None
+                        trigger_sequence()
+                else:
+                    contact_closed_since = None
                 last_state = current_state
                 consecutive_errors = 0
             time.sleep(0.05)
