@@ -365,7 +365,7 @@ class EventLog:
     and also printed to the journal.
     """
 
-    def __init__(self, maxlen=300):
+    def __init__(self, maxlen=500):
         self._events = deque(maxlen=maxlen)
         self._lock = Lock()
         self._counter = 0
@@ -385,6 +385,67 @@ class EventLog:
 
 
 event_log = EventLog()
+
+
+class GlitchTracker:
+    """Collects rejected sub-filter pulses (interference) for one line.
+
+    Every glitch is counted and its width recorded; event-log output is
+    rate-limited so sustained interference (e.g. mains-coupled bounce)
+    produces periodic summaries instead of flooding the ring buffer.
+    """
+
+    LOG_INTERVAL = 10.0  # seconds between per-line glitch log entries
+
+    def __init__(self, name):
+        self.name = name
+        self.count = 0
+        self.max_duration = 0.0
+        self.last = None  # {'ts': wall clock, 'duration': s, 'level': 0/1}
+        self._pending = 0
+        self._pending_min = None
+        self._pending_max = None
+        self._last_log_mono = None
+
+    def record(self, evt, now_mono):
+        self.count += 1
+        dur = evt['duration']
+        self.max_duration = max(self.max_duration, dur)
+        self.last = {'ts': time.time(), 'duration': dur, 'level': evt['level']}
+        if self._last_log_mono is None or (now_mono - self._last_log_mono) >= self.LOG_INTERVAL:
+            level_txt = 'LOW' if evt['level'] == 0 else 'HIGH'
+            event_log.add(
+                'glitch',
+                f"Interference on {self.name} line: ~{dur * 1000:.0f}ms {level_txt} "
+                f"pulse rejected by glitch filter (total {self.count})",
+            )
+            self._last_log_mono = now_mono
+        else:
+            self._pending += 1
+            self._pending_min = dur if self._pending_min is None else min(self._pending_min, dur)
+            self._pending_max = dur if self._pending_max is None else max(self._pending_max, dur)
+
+    def flush(self, now_mono):
+        """Emit a summary of glitches accumulated during the quiet window."""
+        if self._pending and (now_mono - self._last_log_mono) >= self.LOG_INTERVAL:
+            event_log.add(
+                'glitch',
+                f"Interference on {self.name} line: {self._pending} more rejected "
+                f"pulses (~{self._pending_min * 1000:.0f}-{self._pending_max * 1000:.0f}ms, "
+                f"total {self.count})",
+            )
+            self._pending = 0
+            self._pending_min = None
+            self._pending_max = None
+            self._last_log_mono = now_mono
+
+    def stats(self):
+        return {
+            'count': self.count,
+            'max_duration_ms': round(self.max_duration * 1000, 1),
+            'last': self.last,
+        }
+
 
 # ============================================
 # Global State
@@ -412,6 +473,10 @@ class SystemState:
         self.last_trigger = None   # {'ts': wall-clock, 'source': 'gpio'|'web'}
         self.trigger_count = 0
         self.started_at = time.time()
+        self.glitch_trackers = {
+            'contact': GlitchTracker('contact'),
+            'safety': GlitchTracker('safety'),
+        }
 
 state = SystemState()
 
@@ -656,8 +721,17 @@ class LineMonitor:
     Feed raw samples via sample(); a new raw level must persist
     continuously for stable_time seconds before it is accepted as the
     line's stable level, which filters glitches in BOTH directions.
-    sample() returns a transition dict when the stable level changes,
-    and None otherwise.
+
+    sample() returns None when nothing happened, or an event dict:
+      {'kind': 'transition', 'from': 0/1 (None = startup baseline),
+       'to': 0/1, 'at': mono, 'prev_duration': s}
+      {'kind': 'glitch', 'level': 0/1, 'duration': s, 'at': mono}
+        — a pulse that ended before satisfying stable_time and was
+        rejected. 'duration' is an upper-bound estimate at poll
+        resolution: the pulse was first seen at 'at' and had ended by
+        the sample that reports it. These are the interference /
+        false-trigger events the glitch filter absorbs; surfacing
+        them lets interference be measured instead of just filtered.
 
     The very first stable level is reported with 'from' set to None (a
     baseline, not a real transition), so callers can log the startup
@@ -666,7 +740,9 @@ class LineMonitor:
     before it can fire a trigger.
 
     Invalid reads (None) discard any pending candidate so noise around
-    read errors cannot accumulate into a false transition.
+    read errors cannot accumulate into a false transition; such aborted
+    candidates are not reported as glitches because their length can't
+    be trusted.
     """
 
     def __init__(self, name, stable_time):
@@ -681,12 +757,24 @@ class LineMonitor:
         self._candidate_since = None
 
     def sample(self, level, now):
-        """Feed one raw sample (0/1/None). Returns a transition dict or None."""
+        """Feed one raw sample (0/1/None). Returns an event dict or None."""
         if level is None:
             self._candidate = None
             self._candidate_since = None
             return None
         if level == self.stable_level:
+            if self._candidate is not None and self.stable_level is not None:
+                # The line bounced away and came back before stable_time:
+                # a rejected pulse. Report it so interference is measurable.
+                glitch = {
+                    'kind': 'glitch',
+                    'level': self._candidate,
+                    'duration': now - self._candidate_since,
+                    'at': self._candidate_since,
+                }
+                self._candidate = None
+                self._candidate_since = None
+                return glitch
             self._candidate = None
             self._candidate_since = None
             return None
@@ -704,6 +792,7 @@ class LineMonitor:
             self._candidate = None
             self._candidate_since = None
             return {
+                'kind': 'transition',
                 'from': prev,  # None => baseline (startup state), not an edge
                 'to': level,
                 'at': self.stable_since,
@@ -1102,6 +1191,10 @@ def api_status():
         'safety_switch_enabled': config.SAFETY_SWITCH_ENABLED,
         'last_trigger': state.last_trigger,
         'trigger_count': state.trigger_count,
+        'glitches': {
+            name: tracker.stats()
+            for name, tracker in state.glitch_trackers.items()
+        },
         'scene_b_duration': config.SCENE_B_DURATION,
         'channels': get_current_channels(),
     })
@@ -1411,7 +1504,9 @@ def _gpio_monitor():
 
             transition = contact.sample(contact_level, now)
             if transition is not None:
-                if transition['from'] is None:
+                if transition['kind'] == 'glitch':
+                    state.glitch_trackers['contact'].record(transition, now)
+                elif transition['from'] is None:
                     event_log.add(
                         'contact',
                         f"Contact line is {_level_text(transition['to'])} at startup",
@@ -1433,7 +1528,9 @@ def _gpio_monitor():
 
             safety_transition = safety.sample(safety_level, now)
             if safety_transition is not None:
-                if safety_transition['from'] is None:
+                if safety_transition['kind'] == 'glitch':
+                    state.glitch_trackers['safety'].record(safety_transition, now)
+                elif safety_transition['from'] is None:
                     event_log.add(
                         'safety',
                         "Safety switch is "
@@ -1450,6 +1547,9 @@ def _gpio_monitor():
                         apply_scene('scene_a')
                 else:
                     event_log.add('safety', "Safety switch turned ON")
+
+            for tracker in state.glitch_trackers.values():
+                tracker.flush(now)
 
             consecutive_errors = 0
             time.sleep(config.GPIO_POLL_INTERVAL)

@@ -433,6 +433,11 @@
         .event-kind.safety  { color: #eab308; }
         .event-kind.gpio    { color: #a1a1aa; }
         .event-kind.config  { color: #a855f7; }
+        .event-kind.glitch  { color: #f97316; }
+        .status-value.warn  {
+            color: #f97316;
+            text-shadow: 0 0 12px rgba(249, 115, 22, 0.4);
+        }
         .event-msg { color: #e4e4e7; word-break: break-word; }
         .diag-hint { font-size: 12px; color: #71717a; margin-top: 8px; }
         .inline-controls {
@@ -565,6 +570,10 @@
                     <div class="status-label">Last Trigger</div>
                     <div class="status-value" id="diag-last-trigger" style="font-size: 13px; padding-top: 4px;">never</div>
                 </div>
+                <div class="status-item">
+                    <div class="status-label">Interference</div>
+                    <div class="status-value" id="diag-glitches" style="font-size: 13px; padding-top: 4px;" title="Pulses rejected by the glitch filter since startup">0</div>
+                </div>
             </div>
 
             <div class="inline-controls">
@@ -625,7 +634,11 @@
             </div>
 
             <div class="form-group" style="margin-top: 16px; margin-bottom: 0;">
-                <label>Event Log <span style="text-transform: none; letter-spacing: 0;">(live — line transitions, triggers, GPIO state)</span></label>
+                <label style="display: flex; justify-content: space-between; align-items: center;">
+                    <span>Event Log <span style="text-transform: none; letter-spacing: 0;">(live — transitions, triggers, interference, GPIO state)</span></span>
+                    <button class="btn-secondary" onclick="downloadEventLog()"
+                            style="padding: 6px 12px; font-size: 11px;">⬇ Download CSV</button>
+                </label>
                 <div class="event-log" id="event-log">Waiting for events…</div>
             </div>
         </div>
@@ -857,6 +870,31 @@
                 lastEl.textContent = 'never';
             }
 
+            // Interference counter (pulses rejected by the glitch filter)
+            const glitchEl = document.getElementById('diag-glitches');
+            if (data.glitches) {
+                const c = data.glitches.contact || {count: 0};
+                const s = data.glitches.safety || {count: 0};
+                const total = (c.count || 0) + (s.count || 0);
+                if (total === 0) {
+                    glitchEl.textContent = 'none';
+                    glitchEl.className = 'status-value online';
+                    glitchEl.style.fontSize = '14px';
+                } else {
+                    let text = c.count + '× contact';
+                    if (c.max_duration_ms) text += ' ≤' + Math.round(c.max_duration_ms) + 'ms';
+                    if (s.count) text += ' · ' + s.count + '× safety';
+                    glitchEl.textContent = text;
+                    glitchEl.className = 'status-value warn';
+                    glitchEl.style.fontSize = '13px';
+                    if (c.last && c.last.ts) {
+                        glitchEl.title = 'Last: ' + new Date(c.last.ts * 1000).toLocaleTimeString()
+                            + ' (~' + Math.round(c.last.duration * 1000) + 'ms '
+                            + (c.last.level === 0 ? 'LOW' : 'HIGH') + ' pulse)';
+                    }
+                }
+            }
+
             // Settings widgets (don't clobber while user is editing)
             const triggerOnEl = document.getElementById('trigger-on');
             if (data.trigger_on && document.activeElement !== triggerOnEl) {
@@ -1026,6 +1064,34 @@
         }
         const eventsInterval = setInterval(updateEvents, 2000);
         updateEvents();
+
+        function downloadEventLog() {
+            fetch('/api/events', {headers: getApiHeaders()})
+                .then(response => {
+                    if (!response.ok) throw new Error('Events request failed');
+                    return response.json();
+                })
+                .then(data => {
+                    const events = (data.events || []).slice().reverse(); // oldest first for export
+                    const esc = v => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+                    const rows = ['id,timestamp_iso,kind,message'];
+                    for (const evt of events) {
+                        rows.push([evt.id, new Date(evt.ts * 1000).toISOString(),
+                                   evt.kind, evt.message].map(esc).join(','));
+                    }
+                    const blob = new Blob([rows.join('\n') + '\n'], {type: 'text/csv'});
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(blob);
+                    a.download = 'dmx-events-' + new Date().toISOString().replace(/[:.]/g, '-') + '.csv';
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                    showToast('✅ Event log exported (' + events.length + ' events)');
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    showToast('❌ Error exporting event log', true);
+                });
+        }
 
         function updateSliderDisplays() {
             const sliderMap = {
