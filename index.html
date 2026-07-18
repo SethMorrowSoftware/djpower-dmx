@@ -586,7 +586,7 @@
                 </div>
                 <div class="form-group" style="margin-bottom: 0;">
                     <label for="hold-ms">Glitch Filter (ms)</label>
-                    <input type="number" id="hold-ms" min="20" max="2000" step="10" value="50">
+                    <input type="number" id="hold-ms" min="0" max="2000" step="5" value="50">
                 </div>
                 <div class="form-group" style="margin-bottom: 0;">
                     <label for="cooldown-s">Trigger Cooldown (s)</label>
@@ -901,7 +901,7 @@
                 triggerOnEl.value = data.trigger_on;
             }
             const holdEl = document.getElementById('hold-ms');
-            if (data.trigger_hold_time && document.activeElement !== holdEl) {
+            if (data.trigger_hold_time !== undefined && document.activeElement !== holdEl) {
                 holdEl.value = Math.round(data.trigger_hold_time * 1000);
             }
             const cooldownEl = document.getElementById('cooldown-s');
@@ -935,9 +935,14 @@
             // Plain-language explanation of the current trigger config,
             // including a warning when the line is parked at the firing level.
             const firing = data.trigger_on === 'open' ? 'open' : 'closed';
-            let hint = 'Fires when the contact line settles ' +
+            const holdMs = Math.round((data.trigger_hold_time ?? 0.05) * 1000);
+            let hint = 'Fires when the contact line ' +
+                (holdMs === 0
+                    ? 'is first seen ' : 'settles ') +
                 (firing === 'closed' ? 'LOW (closed to GND)' : 'HIGH (open)') +
-                ' for ' + Math.round((data.trigger_hold_time || 0.05) * 1000) + 'ms. ' +
+                (holdMs === 0
+                    ? ' (0ms filter: maximum sensitivity, no noise rejection). '
+                    : ' for ' + holdMs + 'ms. ') +
                 'Cooldown ' + (data.debounce_time ?? 0.3) + 's between triggers.';
             if (data.contact_state === firing) {
                 hint += ' ⚠ Contact is currently AT the firing level — it must leave that state and return before another trigger can fire.';

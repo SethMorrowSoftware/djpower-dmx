@@ -379,7 +379,7 @@ GPIO Pin 17 ──── Contact Switch ──── GND
 - **Trigger polarity is configurable** (web UI → *GPIO Trigger & Diagnostics*):
   - **CLOSES to GND** (default) — for normally-open wiring: the line idles HIGH and the trigger fires when it settles LOW
   - **OPENS** — for normally-closed / inverted wiring where the line idles LOW (e.g. a relay's NC contact, or an external system that holds the line at ground): the trigger fires when the line settles HIGH
-- **Glitch filter** (default 50 ms, tunable 20–2000 ms from the UI): a new line level must persist continuously for the whole window before it counts, in **both** directions. Sub-millisecond interference spikes on long wire runs are ignored, while real button presses and relay pulses (typically 100 ms or longer) fire reliably
+- **Glitch filter** (default 50 ms, tunable 0–2000 ms from the UI): a new line level must persist continuously for the whole window before it counts, in **both** directions. The pins are sampled every 5 ms, so any pulse of at least twice the filter setting is guaranteed to register. **Set the filter below your trigger pulse width**: hand-held buttons and most relays are fine at 50 ms, but some controller outputs pulse for only ~10 ms — the event log's interference entries show the measured width of rejected pulses, so if your triggers are landing there, lower the filter just below the logged width (e.g. 5 ms for ~10 ms pulses). A setting of 0 latches on the first sample seen (maximum sensitivity, no noise rejection — the cooldown still prevents repeats)
 - **Trigger cooldown** (default 300 ms, tunable) prevents multiple triggers from switch bounce or rapid re-closures
 - **Held contacts fire once** — the line must leave the firing level and return to fire again
 - **No trigger at boot** — whatever state the line is in when the service starts is latched as the baseline; a service restart can never fire the fog machine by itself
@@ -408,6 +408,8 @@ The **GPIO Trigger & Diagnostics** card in the web UI shows the live raw level o
 **Full history:** the in-app log keeps the most recent 500 events; every event is also printed to the systemd journal, so the complete record since boot is available with `journalctl -u dmx | grep -E '^\S+ \S+ \S+ gunicorn\[[0-9]+\]: \[(contact|safety|trigger|glitch|gpio|config)\]'` (or simply `journalctl -u dmx`).
 
 **Trigger never fires, UI always shows Contact CLOSED:** the line is sitting at ground. Either the wiring is normally-closed/inverted (fix: set *Trigger fires when contact OPENS* in the UI) or the wire is shorted/on the wrong terminal. If pressing the button produces **no event at all** in the event log, the signal is not reaching GPIO 17 (BCM, physical pin 11) — check the wiring with `pinctrl get 17` (the level should flip while the contact is actuated).
+
+**Triggers show up as interference/glitch entries instead of firing:** your trigger pulse is shorter than the glitch filter. The logged entry shows the pulse's approximate width (e.g. `~10ms HIGH pulse rejected`); set the Glitch Filter below that width (5 ms works for ~10 ms pulses) and save. This is the expected signature of pulse-style controller outputs rather than held contacts.
 
 **Web trigger works but blocked with "Safety switch is OFF":** nothing is pulling GPIO 27 to ground. Wire a toggle between pin 27 and GND, or disable the interlock from the diagnostics card.
 

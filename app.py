@@ -91,13 +91,19 @@ class Config:
     DEBOUNCE_TIME = 0.3  # seconds
     # A new line level must persist continuously for this long before it is
     # accepted as a real state change (filters out interference / transient
-    # signals in BOTH directions). Must stay well below the length of a
-    # momentary button press or relay pulse (~100ms) or real triggers will
-    # be rejected.
+    # signals in BOTH directions). Must stay below the width of the real
+    # trigger pulse or real triggers will be rejected — field data shows
+    # some controller outputs pulse for only ~10ms, so this is tunable from
+    # the web UI down to 0 (0 = latch on the first sample seen: maximum
+    # sensitivity, no noise filtering).
     TRIGGER_HOLD_TIME = 0.05  # seconds
-    # How often the monitor thread samples the GPIO pins. Must be small enough
-    # to fit several samples inside TRIGGER_HOLD_TIME.
-    GPIO_POLL_INTERVAL = 0.01  # seconds
+    # How often the monitor thread samples the GPIO pins. 5ms resolves
+    # ~10ms pulses (any pulse >= 2x this interval is guaranteed to be seen
+    # by two consecutive samples).
+    GPIO_POLL_INTERVAL = 0.005  # seconds
+    # The safety line is a maintained toggle; give it a stability floor so
+    # a very low TRIGGER_HOLD_TIME can't make the lockout flap on bounce.
+    SAFETY_STABLE_TIME_MIN = 0.02  # seconds
     # Which stable contact transition fires the sequence:
     #   'close' - fires when the contact closes to GND (normally-open wiring,
     #             the documented default: line idles HIGH/open)
@@ -226,10 +232,14 @@ config = Config()
 # ============================================
 
 def _clamp_hold_time(value):
-    """Keep the glitch-filter window in a range that can't break triggering."""
+    """Keep the glitch-filter window in a sane range.
+
+    0 is allowed: it latches on the first sample seen (maximum
+    sensitivity for very short trigger pulses, no noise filtering).
+    """
     if value != value:  # NaN
         raise ValueError("NaN")
-    return max(0.02, min(2.0, value))
+    return max(0.0, min(2.0, value))
 
 
 def _clamp_debounce_time(value):
@@ -781,8 +791,11 @@ class LineMonitor:
         if level != self._candidate:
             self._candidate = level
             self._candidate_since = now
-            return None
-        if (now - self._candidate_since) >= self.stable_time:
+            # No return: with stable_time == 0 the candidate promotes on
+            # this same sample (single-sample edge latch).
+        # Epsilon keeps hold == poll-interval semantics exact ("two
+        # consecutive samples") despite float subtraction error.
+        if (now - self._candidate_since) >= self.stable_time - 1e-9:
             prev = self.stable_level
             prev_duration = None
             if self.stable_since is not None:
@@ -1480,9 +1493,11 @@ def _gpio_monitor():
                     time.sleep(5.0)
                     continue
 
-            # Pick up runtime config changes made from the web UI.
+            # Pick up runtime config changes made from the web UI. The
+            # safety toggle keeps a stability floor so a near-zero glitch
+            # filter can't make the lockout flap on switch bounce.
             contact.stable_time = config.TRIGGER_HOLD_TIME
-            safety.stable_time = config.TRIGGER_HOLD_TIME
+            safety.stable_time = max(config.TRIGGER_HOLD_TIME, config.SAFETY_STABLE_TIME_MIN)
 
             now = time.monotonic()
             contact_level = check_contact_state()
