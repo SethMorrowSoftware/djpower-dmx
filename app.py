@@ -8,6 +8,7 @@ from flask import Flask, jsonify, request, send_file
 import time
 import json
 import os
+import re
 import sys
 import glob
 import atexit
@@ -238,6 +239,29 @@ def _clamp_debounce_time(value):
     return max(0.0, min(30.0, value))
 
 
+def _validate_bcm_pin(value):
+    """Validate a header GPIO as a BCM number (2-27; 0/1 are HAT EEPROM)."""
+    pin = int(value)
+    if not (2 <= pin <= 27):
+        raise ValueError("GPIO pin must be a BCM number between 2 and 27")
+    return pin
+
+
+def _normalize_gpio_chip_setting(value):
+    """Normalize the chip override: None/''/'auto' -> None (scan all chips),
+    otherwise a chip index or gpiochip name."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ('', 'auto'):
+        return None
+    if text.isdigit():
+        return int(text)
+    if re.fullmatch(r'(/dev/)?gpiochip\d+', text):
+        return text
+    raise ValueError("GPIO chip must be 'auto', a chip number, or gpiochipN")
+
+
 def save_config():
     """Save current scene config and duration to disk (atomic write)"""
     try:
@@ -249,6 +273,9 @@ def save_config():
             'trigger_hold_time': config.TRIGGER_HOLD_TIME,
             'debounce_time': config.DEBOUNCE_TIME,
             'safety_switch_enabled': config.SAFETY_SWITCH_ENABLED,
+            'contact_pin': config.CONTACT_PIN,
+            'safety_switch_pin': config.SAFETY_SWITCH_PIN,
+            'gpio_chip': config.GPIO_CHIP,
             'scenes': {}
         }
         for key, scene in config.SCENES.items():
@@ -295,6 +322,20 @@ def load_config():
                 pass
         if isinstance(data.get('safety_switch_enabled'), bool):
             config.SAFETY_SWITCH_ENABLED = data['safety_switch_enabled']
+        if 'contact_pin' in data and 'safety_switch_pin' in data:
+            try:
+                contact_pin = _validate_bcm_pin(data['contact_pin'])
+                safety_pin = _validate_bcm_pin(data['safety_switch_pin'])
+                if contact_pin != safety_pin:
+                    config.CONTACT_PIN = contact_pin
+                    config.SAFETY_SWITCH_PIN = safety_pin
+            except (TypeError, ValueError) as e:
+                print(f"WARNING: Invalid saved GPIO pins; keeping defaults: {e}")
+        if 'gpio_chip' in data:
+            try:
+                config.GPIO_CHIP = _normalize_gpio_chip_setting(data['gpio_chip'])
+            except (TypeError, ValueError) as e:
+                print(f"WARNING: Invalid saved GPIO chip; keeping default: {e}")
         if 'scenes' in data:
             for key, scene in data['scenes'].items():
                 if key in config.SCENES:
@@ -324,7 +365,7 @@ class EventLog:
     and also printed to the journal.
     """
 
-    def __init__(self, maxlen=150):
+    def __init__(self, maxlen=300):
         self._events = deque(maxlen=maxlen)
         self._lock = Lock()
         self._counter = 0
@@ -879,6 +920,18 @@ def init_gpio():
     return False
 
 
+def request_gpio_reinit():
+    """Ask the monitor thread to re-initialize GPIO with current settings.
+
+    Used after pin/chip config changes so they take effect immediately;
+    also re-arms the one-shot init-failure log so the outcome of the
+    change is visible in the event log.
+    """
+    global _gpio_init_failure_logged
+    _gpio_init_failure_logged = False
+    state.gpio_ready = False
+
+
 def _gpio_value_to_int(val):
     """Normalize a GPIO read value to int 0 or 1.
 
@@ -1040,6 +1093,9 @@ def api_status():
         'gpio_ready': state.gpio_ready,
         'gpio_lib': GPIO_LIB if state.gpio_ready else None,
         'gpio_chip': str(state.gpio_chip_id) if state.gpio_chip_id is not None else None,
+        'gpio_chip_setting': str(config.GPIO_CHIP) if config.GPIO_CHIP is not None else None,
+        'contact_pin': config.CONTACT_PIN,
+        'safety_switch_pin': config.SAFETY_SWITCH_PIN,
         'trigger_on': config.TRIGGER_ON,
         'trigger_hold_time': config.TRIGGER_HOLD_TIME,
         'debounce_time': config.DEBOUNCE_TIME,
@@ -1210,6 +1266,39 @@ def api_config():
                     + ("ENABLED" if config.SAFETY_SWITCH_ENABLED else "BYPASSED"),
                 )
 
+        # GPIO pin / chip assignment — takes effect immediately via re-init
+        gpio_changed = False
+        if 'contact_pin' in data or 'safety_switch_pin' in data:
+            try:
+                new_contact = _validate_bcm_pin(data.get('contact_pin', config.CONTACT_PIN))
+                new_safety = _validate_bcm_pin(data.get('safety_switch_pin', config.SAFETY_SWITCH_PIN))
+            except (TypeError, ValueError) as e:
+                return jsonify({'error': f'Invalid GPIO pin: {e}'}), 400
+            if new_contact == new_safety:
+                return jsonify({'error': 'Contact and safety pins must be different'}), 400
+            if (new_contact, new_safety) != (config.CONTACT_PIN, config.SAFETY_SWITCH_PIN):
+                config.CONTACT_PIN = new_contact
+                config.SAFETY_SWITCH_PIN = new_safety
+                gpio_changed = True
+                event_log.add(
+                    'config',
+                    f"GPIO pins set: contact={new_contact}, safety={new_safety}",
+                )
+        if 'gpio_chip' in data:
+            try:
+                new_chip = _normalize_gpio_chip_setting(data['gpio_chip'])
+            except (TypeError, ValueError) as e:
+                return jsonify({'error': str(e)}), 400
+            if new_chip != config.GPIO_CHIP:
+                config.GPIO_CHIP = new_chip
+                gpio_changed = True
+                event_log.add(
+                    'config',
+                    f"GPIO chip set to {new_chip if new_chip is not None else 'auto'}",
+                )
+        if gpio_changed:
+            request_gpio_reinit()
+
         # Persist to disk
         save_config()
 
@@ -1223,6 +1312,7 @@ def api_config():
             'scene_b_duration': config.SCENE_B_DURATION,
             'contact_pin': config.CONTACT_PIN,
             'safety_switch_pin': config.SAFETY_SWITCH_PIN,
+            'gpio_chip': str(config.GPIO_CHIP) if config.GPIO_CHIP is not None else None,
             'trigger_on': config.TRIGGER_ON,
             'trigger_hold_time': config.TRIGGER_HOLD_TIME,
             'debounce_time': config.DEBOUNCE_TIME,
