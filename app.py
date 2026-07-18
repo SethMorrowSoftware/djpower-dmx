@@ -114,18 +114,22 @@ class Config:
     # How the trigger is detected (edge-detection backend only):
     #   'level' - a debounced stable level change fires (default; needs the
     #             line to actually reach and hold the firing level)
-    #   'burst' - a shower of raw edges fires. For electrically marginal
+    #   'burst' - accumulated-signal detection for electrically marginal
     #             lines that chatter across the logic threshold instead of
-    #             switching cleanly (weak pull-up vs. long/loaded cable):
-    #             each physical actuation produces a burst of brief edges
-    #             rather than one clean pulse. Fires when BURST_MIN_EDGES
-    #             raw edges (either direction) land within BURST_WINDOW,
-    #             then re-arms only after BURST_QUIET_REARM of silence, so
-    #             one actuation fires exactly once. TRIGGER_ON polarity is
-    #             ignored in burst mode.
+    #             switching cleanly (weak pull-up vs. long/loaded cable).
+    #             Fires when the line accumulates BURST_HIGH_TIME seconds
+    #             away from its idle level within a rolling BURST_WINDOW,
+    #             then re-arms only after BURST_QUIET_REARM at idle, so one
+    #             actuation fires exactly once. Microsecond vibration/EMI
+    #             blips accumulate almost nothing and cannot fire; a real
+    #             actuation carries real signal mass and can. This is the
+    #             mechanism the original 50ms sampler exploited by luck
+    #             (a sample landing inside a HIGH moment), made
+    #             deterministic with exact kernel edge timestamps.
+    #             TRIGGER_ON polarity is ignored in burst mode.
     TRIGGER_MODE = 'level'
-    BURST_MIN_EDGES = 5
-    BURST_WINDOW = 0.2  # seconds
+    BURST_HIGH_TIME = 0.010  # seconds away from idle within the window
+    BURST_WINDOW = 0.5  # seconds
     BURST_QUIET_REARM = 1.0  # seconds
     # Hardware safety-switch interlock on SAFETY_SWITCH_PIN. When disabled,
     # the controller operates as if the switch were ON (useful when pin 27
@@ -265,11 +269,13 @@ def _clamp_debounce_time(value):
     return max(0.0, min(30.0, value))
 
 
-def _clamp_burst_min_edges(value):
-    edges = int(value)
-    if not (2 <= edges <= 100):
-        raise ValueError("burst_min_edges must be between 2 and 100")
-    return edges
+def _clamp_burst_high_time(value):
+    v = float(value)
+    if v != v:
+        raise ValueError("NaN")
+    if not (0.0005 <= v <= 1.0):
+        raise ValueError("burst_high_time must be between 0.0005 and 1.0 seconds")
+    return v
 
 
 def _clamp_burst_window(value):
@@ -320,7 +326,7 @@ def save_config():
             'trigger_mode': config.TRIGGER_MODE,
             'trigger_hold_time': config.TRIGGER_HOLD_TIME,
             'debounce_time': config.DEBOUNCE_TIME,
-            'burst_min_edges': config.BURST_MIN_EDGES,
+            'burst_high_time': config.BURST_HIGH_TIME,
             'burst_window': config.BURST_WINDOW,
             'burst_quiet_rearm': config.BURST_QUIET_REARM,
             'safety_switch_enabled': config.SAFETY_SWITCH_ENABLED,
@@ -364,7 +370,7 @@ def load_config():
         if data.get('trigger_mode') in ('level', 'burst'):
             config.TRIGGER_MODE = data['trigger_mode']
         for key, clamp, attr in (
-                ('burst_min_edges', _clamp_burst_min_edges, 'BURST_MIN_EDGES'),
+                ('burst_high_time', _clamp_burst_high_time, 'BURST_HIGH_TIME'),
                 ('burst_window', _clamp_burst_window, 'BURST_WINDOW'),
                 ('burst_quiet_rearm', _clamp_burst_quiet, 'BURST_QUIET_REARM')):
             if key in data:
@@ -463,16 +469,19 @@ class GlitchTracker:
         self.name = name
         self.count = 0
         self.max_duration = 0.0
+        self.total_time = 0.0  # accumulated width of all rejected pulses
         self.last = None  # {'ts': wall clock, 'duration': s, 'level': 0/1}
         self._pending = 0
         self._pending_min = None
         self._pending_max = None
+        self._pending_sum = 0.0
         self._last_log_mono = None
 
     def record(self, evt, now_mono):
         self.count += 1
         dur = evt['duration']
         self.max_duration = max(self.max_duration, dur)
+        self.total_time += dur
         self.last = {'ts': time.time(), 'duration': dur, 'level': evt['level']}
         if self._last_log_mono is None or (now_mono - self._last_log_mono) >= self.LOG_INTERVAL:
             level_txt = 'LOW' if evt['level'] == 0 else 'HIGH'
@@ -486,6 +495,7 @@ class GlitchTracker:
             self._pending += 1
             self._pending_min = dur if self._pending_min is None else min(self._pending_min, dur)
             self._pending_max = dur if self._pending_max is None else max(self._pending_max, dur)
+            self._pending_sum += dur
 
     def flush(self, now_mono):
         """Emit a summary of glitches accumulated during the quiet window."""
@@ -494,17 +504,19 @@ class GlitchTracker:
                 'glitch',
                 f"Interference on {self.name} line: {self._pending} more rejected "
                 f"pulses (~{self._pending_min * 1000:.1f}-{self._pending_max * 1000:.1f}ms, "
-                f"total {self.count})",
+                f"{self._pending_sum * 1000:.1f}ms combined, total {self.count})",
             )
             self._pending = 0
             self._pending_min = None
             self._pending_max = None
+            self._pending_sum = 0.0
             self._last_log_mono = now_mono
 
     def stats(self):
         return {
             'count': self.count,
             'max_duration_ms': round(self.max_duration * 1000, 1),
+            'total_ms': round(self.total_time * 1000, 1),
             'last': self.last,
         }
 
@@ -959,41 +971,84 @@ class EdgeDebouncer:
 
 
 class BurstDetector:
-    """Fires on showers of raw kernel edges (trigger mode 'burst').
+    """Accumulated-signal detector for electrically marginal lines
+    (trigger mode 'burst').
 
-    Field signature this handles: an electrically marginal line (weak
-    pull-up against long/loaded cable) never switches cleanly — each
-    physical actuation produces hundreds of microsecond-scale edges
-    chattering across the logic threshold instead of one clean pulse.
-    The shower itself becomes the trigger: min_edges raw edges within
-    window fire once, and re-arming requires quiet_rearm seconds of
-    silence first, so a long shower still fires exactly once.
+    Field history: the original 50ms sampler "worked" on a chattering
+    line by accident — a poll sample occasionally landed inside one of
+    the brief HIGH excursions of a real actuation, so it statistically
+    fired on accumulated signal mass. Edge counting replaced it and
+    failed: ambient vibration/EMI produces MORE (but far narrower)
+    edges than a real actuation. This detector implements the working
+    mechanism deterministically: integrate the exact time the line
+    spends away from its idle level within a rolling window and fire
+    when it reaches high_time. Microsecond chatter integrates to
+    almost nothing; real actuations (many/wider excursions, or one
+    clean pulse) cross the threshold. Re-arms only after quiet_rearm
+    seconds at idle, so one actuation fires exactly once.
     """
 
-    def __init__(self, min_edges, window, quiet_rearm):
-        self.min_edges = min_edges
+    def __init__(self, high_time, window, quiet_rearm):
+        self.high_time = high_time
         self.window = window
         self.quiet_rearm = quiet_rearm
         self.reset()
 
     def reset(self):
-        self._times = deque()
+        self._intervals = deque()  # closed (start, end) spans away from idle
+        self._away_since = None
+        self._last_activity = None
         self._armed = True
-        self._last_edge = None
 
-    def edge(self, ts):
-        """Feed one raw edge timestamp. Returns burst info when firing."""
-        if (self._last_edge is not None
-                and (ts - self._last_edge) >= self.quiet_rearm):
+    def idle_changed(self):
+        """The debounced idle level moved (real committed transition) —
+        discard accumulation so the new steady state isn't counted as
+        signal against itself."""
+        self._intervals.clear()
+        self._away_since = None
+
+    def _accumulated(self, now):
+        cutoff = now - self.window
+        while self._intervals and self._intervals[0][1] <= cutoff:
+            self._intervals.popleft()
+        total = sum(end - max(start, cutoff) for start, end in self._intervals)
+        if self._away_since is not None:
+            total += now - max(self._away_since, cutoff)
+        return total
+
+    def ingest(self, level, ts, idle_level):
+        """Feed one kernel edge (level after the edge). Returns fire info
+        or None. idle_level is the line's current debounced level."""
+        if idle_level is None:
+            return None
+        self._last_activity = ts
+        if level != idle_level:
+            if self._away_since is None:
+                self._away_since = ts
+        else:
+            if self._away_since is not None:
+                self._intervals.append((self._away_since, ts))
+                self._away_since = None
+        return self._evaluate(ts)
+
+    def tick(self, now, idle_level):
+        """Periodic check: a still-open excursion (line parked away from
+        idle) accumulates between edges and can cross the threshold."""
+        if idle_level is None:
+            return None
+        return self._evaluate(now)
+
+    def _evaluate(self, now):
+        acc = self._accumulated(now)
+        if self._armed:
+            if acc >= self.high_time:
+                self._armed = False
+                return {'high_ms': acc * 1000.0, 'window_ms': self.window * 1000.0,
+                        'at': now}
+        elif (self._away_since is None
+                and self._last_activity is not None
+                and (now - self._last_activity) >= self.quiet_rearm):
             self._armed = True
-            self._times.clear()
-        self._last_edge = ts
-        self._times.append(ts)
-        while self._times and (ts - self._times[0]) > self.window:
-            self._times.popleft()
-        if self._armed and len(self._times) >= self.min_edges:
-            self._armed = False
-            return {'edges': len(self._times), 'span': ts - self._times[0], 'at': ts}
         return None
 
 
@@ -1421,7 +1476,7 @@ def api_status():
         'safety_switch_pin': config.SAFETY_SWITCH_PIN,
         'trigger_on': config.TRIGGER_ON,
         'trigger_mode': config.TRIGGER_MODE,
-        'burst_min_edges': config.BURST_MIN_EDGES,
+        'burst_high_time': config.BURST_HIGH_TIME,
         'burst_window': config.BURST_WINDOW,
         'burst_quiet_rearm': config.BURST_QUIET_REARM,
         'trigger_hold_time': config.TRIGGER_HOLD_TIME,
@@ -1586,7 +1641,7 @@ def api_config():
 
         # Burst-mode tuning
         for key, clamp, attr, label in (
-                ('burst_min_edges', _clamp_burst_min_edges, 'BURST_MIN_EDGES', 'min edges'),
+                ('burst_high_time', _clamp_burst_high_time, 'BURST_HIGH_TIME', 'fire threshold'),
                 ('burst_window', _clamp_burst_window, 'BURST_WINDOW', 'window'),
                 ('burst_quiet_rearm', _clamp_burst_quiet, 'BURST_QUIET_REARM', 're-arm quiet')):
             if key in data:
@@ -1674,7 +1729,7 @@ def api_config():
             'trigger_mode': config.TRIGGER_MODE,
             'trigger_hold_time': config.TRIGGER_HOLD_TIME,
             'debounce_time': config.DEBOUNCE_TIME,
-            'burst_min_edges': config.BURST_MIN_EDGES,
+            'burst_high_time': config.BURST_HIGH_TIME,
             'burst_window': config.BURST_WINDOW,
             'burst_quiet_rearm': config.BURST_QUIET_REARM,
             'safety_switch_enabled': config.SAFETY_SWITCH_ENABLED,
@@ -1799,7 +1854,7 @@ def _gpio_monitor():
     safety = LineMonitor('safety', config.TRIGGER_HOLD_TIME)
     e_contact = EdgeDebouncer('contact', config.TRIGGER_HOLD_TIME)
     e_safety = EdgeDebouncer('safety', config.TRIGGER_HOLD_TIME)
-    burst = BurstDetector(config.BURST_MIN_EDGES, config.BURST_WINDOW,
+    burst = BurstDetector(config.BURST_HIGH_TIME, config.BURST_WINDOW,
                           config.BURST_QUIET_REARM)
     trigger_ctx = {'last_trigger_time': None}
     last_good_read = None
@@ -1856,9 +1911,16 @@ def _gpio_monitor():
 
             if state.gpio_edge_mode:
                 # --- kernel edge-event mode ---
-                burst.min_edges = config.BURST_MIN_EDGES
+                burst.high_time = config.BURST_HIGH_TIME
                 burst.window = config.BURST_WINDOW
                 burst.quiet_rearm = config.BURST_QUIET_REARM
+
+                def _burst_fire(hit, now):
+                    _fire_gpio_trigger(
+                        now, trigger_ctx,
+                        detail=(f"Signal burst: {hit['high_ms']:.1f}ms away from idle "
+                                f"within {hit['window_ms']:.0f}ms window"),
+                    )
 
                 have_events = state.gpio_line.wait_edge_events(0.02)
                 now = time.monotonic()
@@ -1867,21 +1929,24 @@ def _gpio_monitor():
                         level = 1 if ev.event_type == gpiod.EdgeEvent.Type.RISING_EDGE else 0
                         ts = ev.timestamp_ns / 1e9
                         if ev.line_offset == config.CONTACT_PIN:
-                            hit = burst.edge(ts)
+                            hit = burst.ingest(level, ts, e_contact.stable_level)
                             if burst_mode and hit is not None:
-                                _fire_gpio_trigger(
-                                    now, trigger_ctx,
-                                    detail=(f"Edge burst detected: {hit['edges']} edges "
-                                            f"in {hit['span'] * 1000:.0f}ms"),
-                                )
+                                _burst_fire(hit, now)
                             for evt in e_contact.edge(level, ts):
+                                if evt['kind'] == 'transition':
+                                    burst.idle_changed()
                                 _apply_contact_event(evt, now, trigger_ctx,
                                                      fire=not burst_mode)
                         else:
                             for evt in e_safety.edge(level, ts):
                                 _apply_safety_event(evt, now)
+                hit = burst.tick(now, e_contact.stable_level)
+                if burst_mode and hit is not None:
+                    _burst_fire(hit, now)
                 evt = e_contact.tick(now)
                 if evt is not None:
+                    if evt['kind'] == 'transition':
+                        burst.idle_changed()
                     _apply_contact_event(evt, now, trigger_ctx, fire=not burst_mode)
                 evt = e_safety.tick(now)
                 if evt is not None:
