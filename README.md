@@ -412,6 +412,13 @@ The **GPIO Trigger & Diagnostics** card in the web UI shows the live raw level o
 
 **Triggers show up as interference/glitch entries instead of firing:** your trigger pulse is shorter than the glitch filter. The logged entry shows the pulse's width (exact in edge mode, e.g. `~5.2ms HIGH pulse rejected`); set the Glitch Filter below that width (2 ms works for ~5 ms pulses) and save. This is the expected signature of pulse-style controller outputs rather than held contacts. In polling mode (`· poll` on the Backend tile) the width readings are upper-bound estimates and very short pulses may be missed entirely — edge mode has neither limitation.
 
+**Each trigger attempt logs a SHOWER of tiny pulses (dozens to hundreds of `~0.0ms` interference entries) and never fires:** the line is electrically marginal — it chatters across the logic threshold instead of switching cleanly. Typical cause: the Pi's weak internal pull-up (~50 kΩ) can't cleanly lift a long or loaded line against cable capacitance / leakage from equipment sharing the circuit. Two remedies:
+
+1. **Hardware (preferred):** add an external pull-up — a 1 kΩ–4.7 kΩ resistor from the contact pin to **3.3 V** (never 5 V). This snaps the line cleanly HIGH when the contact opens and usually turns the chatter into clean pulses that LEVEL detection handles at default settings.
+2. **Software (works today):** switch **Detection** to **EDGE BURST** in the diagnostics card. In burst mode the shower itself is the trigger: it fires when ≥ *Burst Min Edges* raw edges (default 5) land within *Burst Window* (default 200 ms), then re-arms only after 1 s of edge silence — so one physical actuation fires exactly once no matter how long the chatter lasts, while a single stray EMI edge can never fire. Polarity and the glitch filter don't gate firing in this mode. Burst mode requires the edge-detection backend (`· edge` on the Backend tile); on polling backends it falls back to LEVEL detection with a logged warning.
+
+**Burst config keys** (`POST /api/config`, persisted): `trigger_mode` (`"level"`/`"burst"`), `burst_min_edges` (2–100), `burst_window` (seconds, 0.02–5), `burst_quiet_rearm` (seconds, 0.1–30).
+
 **Web trigger works but blocked with "Safety switch is OFF":** nothing is pulling GPIO 27 to ground. Wire a toggle between pin 27 and GND, or disable the interlock from the diagnostics card.
 
 **Trigger config keys** (`POST /api/config`, persisted to disk): `trigger_on` (`"close"`/`"open"`), `trigger_hold_time` (seconds, clamped 0.02–2.0), `debounce_time` (seconds, clamped 0–30), `safety_switch_enabled` (bool).

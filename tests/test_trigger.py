@@ -268,6 +268,49 @@ out = deb.edge(0, 0.01) + deb.edge(1, 0.02)
 check("edge bounce before baseline produces no glitch records",
       all(e['kind'] != 'glitch' for e in out), str(out))
 
+print("BurstDetector (trigger_mode='burst', chattering lines):")
+b = app.BurstDetector(5, 0.2, 1.0)
+hits = [h for h in (b.edge(1.0 + i * 0.005) for i in range(10)) if h]
+check("shower of 10 edges fires exactly once, at the 5th edge",
+      len(hits) == 1 and hits[0]['edges'] == 5 and abs(hits[0]['at'] - 1.02) < 1e-9,
+      str(hits))
+more = [h for h in (b.edge(1.06 + i * 0.01) for i in range(30)) if h]
+check("continued shower (30 more edges) does not refire", len(more) == 0)
+again = [h for h in (b.edge(3.0 + i * 0.005) for i in range(6)) if h]
+check("new shower after 1s of quiet fires again", len(again) == 1)
+
+b = app.BurstDetector(5, 0.2, 1.0)
+check("4 edges never fire",
+      not any(b.edge(1.0 + i * 0.01) for i in range(4)))
+b = app.BurstDetector(5, 0.2, 1.0)
+check("5 slow edges (0.5s apart) never fire — window prunes",
+      not any(b.edge(1.0 + i * 0.5) for i in range(5)))
+
+# Field-data shape: ~each actuation = dozens of sub-ms pulses (2 edges each)
+# clumped within ~100ms, showers separated by seconds.
+b = app.BurstDetector(5, 0.2, 1.0)
+fired = 0
+for press in range(3):
+    t0 = 10.0 + press * 5.0
+    for i in range(40):  # 20 blips = 40 edges within ~80ms
+        if b.edge(t0 + i * 0.002):
+            fired += 1
+check("three real-world chatter showers 5s apart fire exactly 3 times",
+      fired == 3, str(fired))
+
+check("burst min edges clamps: 2 ok", app._clamp_burst_min_edges(2) == 2)
+for bad in (1, 101, "x"):
+    try:
+        app._clamp_burst_min_edges(bad)
+        raise AssertionError(f"FAIL: burst_min_edges {bad!r} accepted")
+    except (TypeError, ValueError):
+        passed += 1
+        print(f"  ok - burst_min_edges {bad!r} rejected")
+check("burst window clamps low", app._clamp_burst_window(0.001) == 0.02)
+check("burst window clamps high", app._clamp_burst_window(60) == 5.0)
+check("burst quiet clamps", app._clamp_burst_quiet(0.01) == 0.1
+      and app._clamp_burst_quiet(120) == 30.0)
+
 print("Config clamps:")
 check("hold time clamps low (0 allowed)", app._clamp_hold_time(-1) == 0.0)
 check("hold time zero passes through", app._clamp_hold_time(0.0) == 0.0)
