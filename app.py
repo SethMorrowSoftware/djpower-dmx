@@ -13,14 +13,19 @@ import glob
 import atexit
 import signal
 import tempfile
+from collections import deque
 from threading import Lock, Timer, Thread
 
 try:
     from pyftdi.ftdi import Ftdi
     FTDI_AVAILABLE = True
-except Exception as ftdi_import_error:
+    FTDI_IMPORT_ERROR = None
+except Exception as e:
+    # Capture the message now: the "except ... as" name is unbound once
+    # this block exits, so it cannot be referenced later at runtime.
     Ftdi = None
     FTDI_AVAILABLE = False
+    FTDI_IMPORT_ERROR = str(e)
 import importlib
 import importlib.util
 
@@ -83,14 +88,29 @@ class Config:
 
     # GPIO debounce - cooldown between consecutive triggers
     DEBOUNCE_TIME = 0.3  # seconds
-    # Contact must remain closed continuously for this long before triggering
-    # (filters out interference / transient signals). Must stay well below the
-    # length of a momentary button press or relay pulse (~100ms) or real
-    # triggers will be rejected.
+    # A new line level must persist continuously for this long before it is
+    # accepted as a real state change (filters out interference / transient
+    # signals in BOTH directions). Must stay well below the length of a
+    # momentary button press or relay pulse (~100ms) or real triggers will
+    # be rejected.
     TRIGGER_HOLD_TIME = 0.05  # seconds
     # How often the monitor thread samples the GPIO pins. Must be small enough
     # to fit several samples inside TRIGGER_HOLD_TIME.
     GPIO_POLL_INTERVAL = 0.01  # seconds
+    # Which stable contact transition fires the sequence:
+    #   'close' - fires when the contact closes to GND (normally-open wiring,
+    #             the documented default: line idles HIGH/open)
+    #   'open'  - fires when the contact opens (normally-closed / inverted
+    #             wiring: line idles LOW/closed and lifts on trigger)
+    # Changeable at runtime from the web UI and persisted to disk.
+    TRIGGER_ON = 'close'
+    # Hardware safety-switch interlock on SAFETY_SWITCH_PIN. When disabled,
+    # the controller operates as if the switch were ON (useful when pin 27
+    # is not actually wired to a switch, or while diagnosing wiring).
+    SAFETY_SWITCH_ENABLED = True
+    # If GPIO reads keep failing for this long while initialized, tear down
+    # and re-initialize the GPIO stack.
+    GPIO_READ_FAIL_REINIT = 5.0  # seconds
 
     # DJPOWER H-IP20V Fog Machine (16-channel mode)
     # Full channel map:
@@ -204,6 +224,20 @@ config = Config()
 # Config Persistence
 # ============================================
 
+def _clamp_hold_time(value):
+    """Keep the glitch-filter window in a range that can't break triggering."""
+    if value != value:  # NaN
+        raise ValueError("NaN")
+    return max(0.02, min(2.0, value))
+
+
+def _clamp_debounce_time(value):
+    """Keep the post-trigger cooldown in a sane range."""
+    if value != value:  # NaN
+        raise ValueError("NaN")
+    return max(0.0, min(30.0, value))
+
+
 def save_config():
     """Save current scene config and duration to disk (atomic write)"""
     try:
@@ -211,6 +245,10 @@ def save_config():
         os.makedirs(config_dir, exist_ok=True)
         data = {
             'scene_b_duration': config.SCENE_B_DURATION,
+            'trigger_on': config.TRIGGER_ON,
+            'trigger_hold_time': config.TRIGGER_HOLD_TIME,
+            'debounce_time': config.DEBOUNCE_TIME,
+            'safety_switch_enabled': config.SAFETY_SWITCH_ENABLED,
             'scenes': {}
         }
         for key, scene in config.SCENES.items():
@@ -243,6 +281,20 @@ def load_config():
             data = json.load(f)
         if 'scene_b_duration' in data:
             config.SCENE_B_DURATION = float(data['scene_b_duration'])
+        if data.get('trigger_on') in ('close', 'open'):
+            config.TRIGGER_ON = data['trigger_on']
+        if 'trigger_hold_time' in data:
+            try:
+                config.TRIGGER_HOLD_TIME = _clamp_hold_time(float(data['trigger_hold_time']))
+            except (TypeError, ValueError):
+                pass
+        if 'debounce_time' in data:
+            try:
+                config.DEBOUNCE_TIME = _clamp_debounce_time(float(data['debounce_time']))
+            except (TypeError, ValueError):
+                pass
+        if isinstance(data.get('safety_switch_enabled'), bool):
+            config.SAFETY_SWITCH_ENABLED = data['safety_switch_enabled']
         if 'scenes' in data:
             for key, scene in data['scenes'].items():
                 if key in config.SCENES:
@@ -258,6 +310,40 @@ def load_config():
         print("Loaded saved configuration from disk")
     except Exception as e:
         print(f"WARNING: Could not load config (using defaults): {e}")
+
+# ============================================
+# Event Log (remote diagnostics)
+# ============================================
+
+class EventLog:
+    """Thread-safe ring buffer of recent hardware/trigger events.
+
+    Lets the wiring and trigger behavior be diagnosed from the web UI
+    without SSH or physical access: every debounced line transition,
+    trigger (fired/blocked), and GPIO lifecycle event is recorded here
+    and also printed to the journal.
+    """
+
+    def __init__(self, maxlen=150):
+        self._events = deque(maxlen=maxlen)
+        self._lock = Lock()
+        self._counter = 0
+
+    def add(self, kind, message, **fields):
+        with self._lock:
+            self._counter += 1
+            evt = {'id': self._counter, 'ts': time.time(), 'kind': kind, 'message': message}
+            evt.update(fields)
+            self._events.append(evt)
+        print(f"[{kind}] {message}")
+
+    def snapshot(self):
+        """Return events newest-first."""
+        with self._lock:
+            return list(self._events)[::-1]
+
+
+event_log = EventLog()
 
 # ============================================
 # Global State
@@ -282,6 +368,9 @@ class SystemState:
         self.dmx_running = False
         self.enttec_url = None
         self.enttec_last_error = None
+        self.last_trigger = None   # {'ts': wall-clock, 'source': 'gpio'|'web'}
+        self.trigger_count = 0
+        self.started_at = time.time()
 
 state = SystemState()
 
@@ -292,7 +381,7 @@ state = SystemState()
 def init_enttec():
     """Initialize ENTTEC Open DMX USB"""
     if not FTDI_AVAILABLE:
-        state.enttec_last_error = f"pyftdi unavailable: {ftdi_import_error}"
+        state.enttec_last_error = f"pyftdi unavailable: {FTDI_IMPORT_ERROR}"
         print(f"ERROR: {state.enttec_last_error}")
         return False
 
@@ -520,6 +609,68 @@ def get_current_channels():
 # GPIO Functions
 # ============================================
 
+class LineMonitor:
+    """Debounced state tracker for one GPIO line.
+
+    Feed raw samples via sample(); a new raw level must persist
+    continuously for stable_time seconds before it is accepted as the
+    line's stable level, which filters glitches in BOTH directions.
+    sample() returns a transition dict when the stable level changes,
+    and None otherwise.
+
+    The very first stable level is reported with 'from' set to None (a
+    baseline, not a real transition), so callers can log the startup
+    state without treating it as an edge — a line that is already in
+    its "active" state at startup must leave that state and come back
+    before it can fire a trigger.
+
+    Invalid reads (None) discard any pending candidate so noise around
+    read errors cannot accumulate into a false transition.
+    """
+
+    def __init__(self, name, stable_time):
+        self.name = name
+        self.stable_time = stable_time
+        self.reset()
+
+    def reset(self):
+        self.stable_level = None   # last accepted level (0/1), None until baseline
+        self.stable_since = None   # monotonic time current stable level began
+        self._candidate = None
+        self._candidate_since = None
+
+    def sample(self, level, now):
+        """Feed one raw sample (0/1/None). Returns a transition dict or None."""
+        if level is None:
+            self._candidate = None
+            self._candidate_since = None
+            return None
+        if level == self.stable_level:
+            self._candidate = None
+            self._candidate_since = None
+            return None
+        if level != self._candidate:
+            self._candidate = level
+            self._candidate_since = now
+            return None
+        if (now - self._candidate_since) >= self.stable_time:
+            prev = self.stable_level
+            prev_duration = None
+            if self.stable_since is not None:
+                prev_duration = self._candidate_since - self.stable_since
+            self.stable_level = level
+            self.stable_since = self._candidate_since
+            self._candidate = None
+            self._candidate_since = None
+            return {
+                'from': prev,  # None => baseline (startup state), not an edge
+                'to': level,
+                'at': self.stable_since,
+                'prev_duration': prev_duration,
+            }
+        return None
+
+
 def _normalize_gpiochip_id(chip_id):
     if chip_id is None:
         return None
@@ -625,6 +776,9 @@ def _open_lgpio_line(chip_id):
         raise
 
 
+_gpio_init_failure_logged = False
+
+
 def init_gpio():
     """Initialize GPIO for contact closure detection.
 
@@ -632,7 +786,7 @@ def init_gpio():
     (lgpio) if all chips fail.  This is important for Pi 4 where gpiod may
     have version/compatibility issues while lgpio works fine.
     """
-    global GPIO_LIB
+    global GPIO_LIB, _gpio_init_failure_logged
 
     if not GPIO_AVAILABLE:
         print("GPIO not available (not running on Raspberry Pi)")
@@ -686,7 +840,11 @@ def init_gpio():
                         state.gpio_ready = True
                         state.gpio_chip_id = chip_id
                         GPIO_LIB = 'gpiod'
-                        print(f"GPIO initialized (gpiod) - {chip_id} pin {config.CONTACT_PIN} with pull-up")
+                        _gpio_init_failure_logged = False
+                        event_log.add(
+                            'gpio',
+                            f"GPIO initialized (gpiod) - {chip_id} pin {config.CONTACT_PIN} with pull-up",
+                        )
                         return True
                     except Exception as e:
                         print(f"GPIO init failed on {chip_id} (gpiod): {e}")
@@ -698,7 +856,11 @@ def init_gpio():
                         state.gpio_ready = True
                         state.gpio_chip_id = chip_id
                         GPIO_LIB = 'lgpio'
-                        print(f"GPIO initialized (lgpio) - {chip_id} pin {config.CONTACT_PIN} with pull-up")
+                        _gpio_init_failure_logged = False
+                        event_log.add(
+                            'gpio',
+                            f"GPIO initialized (lgpio) - {chip_id} pin {config.CONTACT_PIN} with pull-up",
+                        )
                         return True
                     except Exception as e:
                         print(f"GPIO init failed on {chip_id} (lgpio): {e}")
@@ -707,7 +869,13 @@ def init_gpio():
             print(f"GPIO initialization failed ({lib}): {e}")
 
     state.gpio_ready = False
-    print("GPIO: all libraries and chips exhausted — GPIO trigger unavailable")
+    if not _gpio_init_failure_logged:
+        _gpio_init_failure_logged = True
+        event_log.add(
+            'gpio',
+            "GPIO init failed: all libraries and chips exhausted — trigger unavailable "
+            "(will keep retrying silently)",
+        )
     return False
 
 
@@ -762,18 +930,31 @@ def check_safety_switch_state():
 
 
 def is_safe_to_operate():
-    """True when safety switch allows machine operation."""
+    """True when safety switch allows machine operation.
+
+    With the interlock disabled in config, operation is always allowed
+    (used when pin 27 is not wired to a real switch, or while diagnosing
+    wiring remotely).
+    """
+    if not config.SAFETY_SWITCH_ENABLED:
+        return True
     safety_state = check_safety_switch_state()
     return safety_state == 0
 
 
-def trigger_sequence():
+def trigger_sequence(source='web'):
     """Execute the lighting sequence (thread-safe)"""
     if not is_safe_to_operate():
-        print("Trigger ignored: safety switch is OFF/unsafe")
+        event_log.add('trigger', f"Trigger from {source} BLOCKED: safety switch is OFF")
         return False
 
-    print("\nTRIGGER DETECTED!")
+    state.trigger_count += 1
+    state.last_trigger = {'ts': time.time(), 'source': source}
+    event_log.add(
+        'trigger',
+        f"Trigger from {source}: Scene B for {config.SCENE_B_DURATION:g}s "
+        f"(#{state.trigger_count})",
+    )
 
     with state.timer_lock:
         # Cancel any existing timer
@@ -857,9 +1038,23 @@ def api_status():
         'safe_to_operate': is_safe_to_operate(),
         'gpio_available': GPIO_AVAILABLE,
         'gpio_ready': state.gpio_ready,
+        'gpio_lib': GPIO_LIB if state.gpio_ready else None,
+        'gpio_chip': str(state.gpio_chip_id) if state.gpio_chip_id is not None else None,
+        'trigger_on': config.TRIGGER_ON,
+        'trigger_hold_time': config.TRIGGER_HOLD_TIME,
+        'debounce_time': config.DEBOUNCE_TIME,
+        'safety_switch_enabled': config.SAFETY_SWITCH_ENABLED,
+        'last_trigger': state.last_trigger,
+        'trigger_count': state.trigger_count,
         'scene_b_duration': config.SCENE_B_DURATION,
         'channels': get_current_channels(),
     })
+
+
+@app.route('/api/events')
+def api_events():
+    """Recent hardware/trigger events (newest first) for remote diagnostics."""
+    return jsonify({'events': event_log.snapshot()})
 
 
 @app.route('/api/trigger', methods=['POST'])
@@ -977,6 +1172,44 @@ def api_config():
             except (TypeError, ValueError):
                 return jsonify({'error': 'Invalid duration value'}), 400
 
+        # Trigger polarity: which stable contact transition fires
+        if 'trigger_on' in data:
+            if data['trigger_on'] not in ('close', 'open'):
+                return jsonify({'error': "trigger_on must be 'close' or 'open'"}), 400
+            if data['trigger_on'] != config.TRIGGER_ON:
+                config.TRIGGER_ON = data['trigger_on']
+                event_log.add(
+                    'config',
+                    f"Trigger polarity set to fire on contact {config.TRIGGER_ON.upper()}",
+                )
+
+        # Glitch-filter window and post-trigger cooldown
+        if 'trigger_hold_time' in data:
+            try:
+                config.TRIGGER_HOLD_TIME = _clamp_hold_time(float(data['trigger_hold_time']))
+            except (TypeError, ValueError):
+                return jsonify({'error': 'Invalid trigger_hold_time value'}), 400
+            event_log.add('config', f"Glitch filter set to {config.TRIGGER_HOLD_TIME * 1000:g}ms")
+
+        if 'debounce_time' in data:
+            try:
+                config.DEBOUNCE_TIME = _clamp_debounce_time(float(data['debounce_time']))
+            except (TypeError, ValueError):
+                return jsonify({'error': 'Invalid debounce_time value'}), 400
+            event_log.add('config', f"Trigger cooldown set to {config.DEBOUNCE_TIME:g}s")
+
+        # Hardware safety-switch interlock enable/bypass
+        if 'safety_switch_enabled' in data:
+            if not isinstance(data['safety_switch_enabled'], bool):
+                return jsonify({'error': 'safety_switch_enabled must be true or false'}), 400
+            if data['safety_switch_enabled'] != config.SAFETY_SWITCH_ENABLED:
+                config.SAFETY_SWITCH_ENABLED = data['safety_switch_enabled']
+                event_log.add(
+                    'config',
+                    "Safety switch interlock "
+                    + ("ENABLED" if config.SAFETY_SWITCH_ENABLED else "BYPASSED"),
+                )
+
         # Persist to disk
         save_config()
 
@@ -990,6 +1223,10 @@ def api_config():
             'scene_b_duration': config.SCENE_B_DURATION,
             'contact_pin': config.CONTACT_PIN,
             'safety_switch_pin': config.SAFETY_SWITCH_PIN,
+            'trigger_on': config.TRIGGER_ON,
+            'trigger_hold_time': config.TRIGGER_HOLD_TIME,
+            'debounce_time': config.DEBOUNCE_TIME,
+            'safety_switch_enabled': config.SAFETY_SWITCH_ENABLED,
         })
 
 # ============================================
@@ -1019,12 +1256,33 @@ def api_health():
 _initialized = False
 
 
+def _fmt_duration(seconds):
+    """Human-readable duration for event log messages."""
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    minutes, secs = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    return f"{minutes}m {secs:02d}s"
+
+
+def _level_text(level):
+    return 'CLOSED' if level == 0 else 'OPEN'
+
+
+def gpio_fire_level():
+    """Stable contact level that fires the trigger, per configured polarity."""
+    return 0 if config.TRIGGER_ON == 'close' else 1
+
+
 def _gpio_monitor():
-    """Background thread: polls GPIO for contact closure events with debounce."""
-    last_state = None
-    last_safety_state = None
-    last_trigger_time = 0.0
-    contact_closed_since = None
+    """Background thread: samples both GPIO lines, debounces them, and
+    fires the trigger sequence on the configured contact transition."""
+    contact = LineMonitor('contact', config.TRIGGER_HOLD_TIME)
+    safety = LineMonitor('safety', config.TRIGGER_HOLD_TIME)
+    last_trigger_time = None
+    last_good_read = None
     consecutive_errors = 0
     max_errors_before_reinit = 3
 
@@ -1032,48 +1290,85 @@ def _gpio_monitor():
         try:
             if not state.gpio_ready:
                 if init_gpio():
-                    print("GPIO initialized from monitor thread")
-                    last_state = None
-                    contact_closed_since = None
+                    contact.reset()
+                    safety.reset()
+                    last_good_read = None
                 else:
                     time.sleep(5.0)
                     continue
 
-            current_state = check_contact_state()
-            safety_state = check_safety_switch_state()
-            if safety_state is not None:
-                if last_safety_state == 0 and safety_state == 1:
-                    print("Safety switch turned OFF - forcing Scene A")
-                    with state.timer_lock:
-                        if state.scene_b_timer is not None:
-                            state.scene_b_timer.cancel()
-                            state.scene_b_timer = None
-                    apply_scene('scene_a')
-                last_safety_state = safety_state
+            # Pick up runtime config changes made from the web UI.
+            contact.stable_time = config.TRIGGER_HOLD_TIME
+            safety.stable_time = config.TRIGGER_HOLD_TIME
 
-            if current_state is not None:
-                now = time.monotonic()
-                if current_state == 0:
-                    if last_state != 0:
-                        contact_closed_since = now
-                    elif (contact_closed_since is not None
-                            and (now - contact_closed_since) >= config.TRIGGER_HOLD_TIME
-                            and (now - last_trigger_time) >= config.DEBOUNCE_TIME):
-                        last_trigger_time = now
-                        contact_closed_since = None
-                        trigger_sequence()
+            now = time.monotonic()
+            contact_level = check_contact_state()
+            safety_level = check_safety_switch_state()
+
+            # The read helpers swallow their own exceptions and return None.
+            # If both lines stay unreadable the GPIO handle is dead — tear
+            # down and re-initialize instead of spinning silently forever.
+            if contact_level is None and safety_level is None:
+                if last_good_read is None:
+                    last_good_read = now
+                elif (now - last_good_read) >= config.GPIO_READ_FAIL_REINIT:
+                    event_log.add('gpio', "GPIO reads failing continuously - re-initializing")
+                    state.gpio_ready = False
+                    last_good_read = None
+                    continue
+            else:
+                last_good_read = now
+
+            transition = contact.sample(contact_level, now)
+            if transition is not None:
+                if transition['from'] is None:
+                    event_log.add(
+                        'contact',
+                        f"Contact line is {_level_text(transition['to'])} at startup",
+                    )
                 else:
-                    contact_closed_since = None
-                last_state = current_state
-                consecutive_errors = 0
+                    event_log.add(
+                        'contact',
+                        f"Contact {_level_text(transition['to'])} "
+                        f"(was {_level_text(transition['from'])} for "
+                        f"{_fmt_duration(transition['prev_duration'])})",
+                    )
+                    if transition['to'] == gpio_fire_level():
+                        if (last_trigger_time is None
+                                or (now - last_trigger_time) >= config.DEBOUNCE_TIME):
+                            last_trigger_time = now
+                            trigger_sequence(source='gpio')
+                        else:
+                            event_log.add('trigger', "GPIO trigger suppressed (cooldown active)")
+
+            safety_transition = safety.sample(safety_level, now)
+            if safety_transition is not None:
+                if safety_transition['from'] is None:
+                    event_log.add(
+                        'safety',
+                        "Safety switch is "
+                        f"{'ON' if safety_transition['to'] == 0 else 'OFF'} at startup",
+                    )
+                elif safety_transition['to'] == 1:
+                    event_log.add('safety', "Safety switch turned OFF")
+                    if config.SAFETY_SWITCH_ENABLED:
+                        event_log.add('safety', "Forcing Scene A (safety lockout)")
+                        with state.timer_lock:
+                            if state.scene_b_timer is not None:
+                                state.scene_b_timer.cancel()
+                                state.scene_b_timer = None
+                        apply_scene('scene_a')
+                else:
+                    event_log.add('safety', "Safety switch turned ON")
+
+            consecutive_errors = 0
             time.sleep(config.GPIO_POLL_INTERVAL)
         except Exception as e:
             consecutive_errors += 1
             print(f"WARNING: GPIO monitor error ({consecutive_errors}/{max_errors_before_reinit}): {e}")
             if consecutive_errors >= max_errors_before_reinit:
-                print("Attempting GPIO re-initialization...")
+                event_log.add('gpio', f"GPIO monitor errors - re-initializing ({e})")
                 state.gpio_ready = False
-                last_state = None
                 consecutive_errors = 0
             time.sleep(1.0)
 
@@ -1175,8 +1470,10 @@ def _on_sigterm(_signum, _frame):
 
 # --- Module-level initialization ---
 # This runs when gunicorn imports the module (app:app) OR when run directly.
-signal.signal(signal.SIGTERM, _on_sigterm)
-_initialize()
+# Set DMX_SKIP_AUTOINIT=1 to import without touching hardware (tests/tooling).
+if os.environ.get("DMX_SKIP_AUTOINIT") != "1":
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    _initialize()
 
 
 def main():

@@ -376,10 +376,13 @@ GPIO Pin 17 ──── Contact Switch ──── GND
 ```
 
 - **Internal pull-up** is enabled, so pin 17 reads HIGH (1) when the contact is open
-- **Closing the contact** pulls the pin LOW (0), which triggers Scene B
-- **Glitch filter**: the contact must stay closed continuously for 50 ms before the trigger fires. Sub-millisecond interference spikes on long wire runs are ignored, while real button presses and relay pulses (typically 100 ms or longer) fire reliably
-- **Trigger cooldown** of 300 ms prevents multiple triggers from switch bounce or rapid re-closures
-- **Held closures fire once** — the contact must open and close again to re-trigger
+- **Trigger polarity is configurable** (web UI → *GPIO Trigger & Diagnostics*):
+  - **CLOSES to GND** (default) — for normally-open wiring: the line idles HIGH and the trigger fires when it settles LOW
+  - **OPENS** — for normally-closed / inverted wiring where the line idles LOW (e.g. a relay's NC contact, or an external system that holds the line at ground): the trigger fires when the line settles HIGH
+- **Glitch filter** (default 50 ms, tunable 20–2000 ms from the UI): a new line level must persist continuously for the whole window before it counts, in **both** directions. Sub-millisecond interference spikes on long wire runs are ignored, while real button presses and relay pulses (typically 100 ms or longer) fire reliably
+- **Trigger cooldown** (default 300 ms, tunable) prevents multiple triggers from switch bounce or rapid re-closures
+- **Held contacts fire once** — the line must leave the firing level and return to fire again
+- **No trigger at boot** — whatever state the line is in when the service starts is latched as the baseline; a service restart can never fire the fog machine by itself
 - **No external resistor needed** — the internal pull-up is sufficient
 
 Safety toggle wiring (maintained ON/OFF switch):
@@ -392,8 +395,29 @@ GPIO Pin 27 ──── Safety Toggle ──── GND
 - **Switch OFF (open)** -> pin reads HIGH (1) -> **LOCKED OUT**
 - While locked out, `/api/trigger` is blocked and scene applies for `scene_b`, `scene_c`, and `scene_d` return HTTP 409
 - If the safety switch is turned OFF during operation, the controller cancels any active trigger timer and forces Scene A
+- **The interlock can be disabled** from the web UI (with confirmation) if pin 27 is not wired to a real switch; the controller then operates as if the switch were ON. The header tile shows **BYPASS** while disabled
 
 If the GPIO hardware is unavailable (e.g., not running on a Raspberry Pi), the controller continues to run but GPIO-triggered and GPIO-safety behavior will remain unavailable until GPIO initialization succeeds.
+
+### GPIO Diagnostics and Troubleshooting
+
+The **GPIO Trigger & Diagnostics** card in the web UI shows the live raw level of both lines, which GPIO backend/chip is in use, a trigger counter with the last trigger's time and source (`gpio` or `web`), and a live **event log** of every debounced line transition, trigger (fired, suppressed, or blocked), config change, and GPIO lifecycle event. The same data is available at `GET /api/events`. Because transitions are logged with timestamps and how long the previous state lasted, you can have someone press the physical button on site and read exactly what the line did afterward — no SSH required.
+
+**Trigger never fires, UI always shows Contact CLOSED:** the line is sitting at ground. Either the wiring is normally-closed/inverted (fix: set *Trigger fires when contact OPENS* in the UI) or the wire is shorted/on the wrong terminal. If pressing the button produces **no event at all** in the event log, the signal is not reaching GPIO 17 (BCM, physical pin 11) — check the wiring with `pinctrl get 17` (the level should flip while the contact is actuated).
+
+**Web trigger works but blocked with "Safety switch is OFF":** nothing is pulling GPIO 27 to ground. Wire a toggle between pin 27 and GND, or disable the interlock from the diagnostics card.
+
+**Trigger config keys** (`POST /api/config`, persisted to disk): `trigger_on` (`"close"`/`"open"`), `trigger_hold_time` (seconds, clamped 0.02–2.0), `debounce_time` (seconds, clamped 0–30), `safety_switch_enabled` (bool).
+
+### Tests
+
+The trigger engine has a dependency-free test suite that simulates realistic waveforms (button presses, relay pulses, EMI glitches, inverted wiring, boot states, read failures) across every poll alignment:
+
+```bash
+DMX_SKIP_AUTOINIT=1 python3 tests/test_trigger.py
+```
+
+`DMX_SKIP_AUTOINIT=1` imports the app without touching hardware.
 
 ### Network Security Considerations
 
