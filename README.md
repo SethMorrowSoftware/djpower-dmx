@@ -377,8 +377,11 @@ GPIO Pin 17 ──── Contact Switch ──── GND
 
 - **Internal pull-up** is enabled, so pin 17 reads HIGH (1) when the contact is open
 - **Closing the contact** pulls the pin LOW (0), which triggers Scene B
-- **Debounce window** of 300 ms prevents multiple triggers from switch bounce
+- **Glitch filter**: the contact must stay closed continuously for 50 ms before the trigger fires. Sub-millisecond interference spikes on long wire runs are ignored, while real button presses and relay pulses (typically 100 ms or longer) fire reliably
+- **Trigger cooldown** of 300 ms prevents multiple triggers from switch bounce or rapid re-closures
+- **Held closures fire once** — the contact must open and close again to re-trigger
 - **No external resistor needed** — the internal pull-up is sufficient
+
 Safety toggle wiring (maintained ON/OFF switch):
 
 ```

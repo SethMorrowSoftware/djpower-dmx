@@ -84,8 +84,13 @@ class Config:
     # GPIO debounce - cooldown between consecutive triggers
     DEBOUNCE_TIME = 0.3  # seconds
     # Contact must remain closed continuously for this long before triggering
-    # (filters out interference / transient signals)
-    TRIGGER_HOLD_TIME = 0.8  # seconds
+    # (filters out interference / transient signals). Must stay well below the
+    # length of a momentary button press or relay pulse (~100ms) or real
+    # triggers will be rejected.
+    TRIGGER_HOLD_TIME = 0.05  # seconds
+    # How often the monitor thread samples the GPIO pins. Must be small enough
+    # to fit several samples inside TRIGGER_HOLD_TIME.
+    GPIO_POLL_INTERVAL = 0.01  # seconds
 
     # DJPOWER H-IP20V Fog Machine (16-channel mode)
     # Full channel map:
@@ -1061,7 +1066,7 @@ def _gpio_monitor():
                     contact_closed_since = None
                 last_state = current_state
                 consecutive_errors = 0
-            time.sleep(0.05)
+            time.sleep(config.GPIO_POLL_INTERVAL)
         except Exception as e:
             consecutive_errors += 1
             print(f"WARNING: GPIO monitor error ({consecutive_errors}/{max_errors_before_reinit}): {e}")
