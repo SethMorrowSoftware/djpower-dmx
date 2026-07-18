@@ -42,6 +42,7 @@ def simulate(pulses, trigger_on, duration=4.0, offset=0.0,
     fire_level = 0 if trigger_on == 'close' else 1
     triggers = []
     transitions = []
+    glitches = []
     baseline = None
     last_trigger_time = None
 
@@ -49,7 +50,9 @@ def simulate(pulses, trigger_on, duration=4.0, offset=0.0,
     while t < duration:
         tr = monitor.sample(read(t), t)
         if tr is not None:
-            if tr['from'] is None:
+            if tr['kind'] == 'glitch':
+                glitches.append(tr)
+            elif tr['from'] is None:
                 baseline = tr['to']
             else:
                 transitions.append(tr)
@@ -58,14 +61,14 @@ def simulate(pulses, trigger_on, duration=4.0, offset=0.0,
                         last_trigger_time = t
                         triggers.append(round(t, 4))
         t = round(t + POLL, 6)
-    return triggers, transitions, baseline
+    return triggers, transitions, baseline, glitches
 
 
 def sweep(pulses, trigger_on, **kw):
     """Run simulate() across 10 poll alignments; return set of trigger counts."""
     counts = set()
     for o in range(10):
-        trig, _, _ = simulate(pulses, trigger_on, offset=o * 0.001, **kw)
+        trig, _, _, _ = simulate(pulses, trigger_on, offset=o * 0.001, **kw)
         counts.add(len(trig))
     return counts
 
@@ -126,7 +129,7 @@ check("30ms high transient never fires",
 check("two pulses 1s apart fire twice",
       sweep(inverted([(1.0, 0.15), (2.0, 0.15)]), 'open') == {2})
 
-trig, transitions, baseline = simulate(inverted([(1.0, 0.15)]), 'open')
+trig, transitions, baseline, _ = simulate(inverted([(1.0, 0.15)]), 'open')
 check("baseline latched as CLOSED (0) without an edge",
       baseline == 0)
 check("pulse produces open+close transition pair",
@@ -169,6 +172,53 @@ for bad in (float('nan'),):
     except ValueError:
         passed += 1
         print("  ok - NaN rejected by clamp")
+
+print("Interference (glitch) tracking:")
+_, _, _, glitches = simulate([(0.5, 0.03)], 'close')
+check("30ms transient reported as exactly one glitch",
+      len(glitches) == 1, str(glitches))
+check("glitch reports LOW level and plausible duration",
+      glitches[0]['level'] == 0 and 0.02 <= glitches[0]['duration'] <= 0.06,
+      f"{glitches[0]['duration']:.3f}s")
+_, _, _, glitches = simulate([(0.5 + i * 0.05, 0.002) for i in range(5)], 'close')
+check("burst of five 2ms spikes reported as five glitches",
+      len(glitches) == 5, str(len(glitches)))
+_, _, _, glitches = simulate([(0.5, 0.1)], 'close')
+check("real 100ms press produces no glitch records", len(glitches) == 0)
+# Bounce before the baseline is established must not count as interference.
+mon = app.LineMonitor('x', 0.05)
+pre_baseline = []
+t = 0.0
+for lvl in [1, 0, 1, 1, 1, 1, 1, 1, 1, 1]:
+    evt = mon.sample(lvl, t)
+    if evt and evt['kind'] == 'glitch':
+        pre_baseline.append(evt)
+    t += 0.01
+check("bounce before baseline is not counted as a glitch", len(pre_baseline) == 0)
+
+print("GlitchTracker aggregation:")
+tracker = app.GlitchTracker('test-line')
+base_events = len(app.event_log.snapshot())
+now = 100.0
+for i in range(6):
+    tracker.record({'level': 0, 'duration': 0.005 * (i + 1), 'at': now}, now)
+    now += 0.5
+logged = [e for e in app.event_log.snapshot() if e['kind'] == 'glitch']
+check("first glitch logged immediately, burst suppressed",
+      len(logged) == 1, f"{len(logged)} log entries for 6 glitches")
+tracker.flush(now)  # still inside the 10s window
+check("flush inside quiet window emits nothing",
+      len([e for e in app.event_log.snapshot() if e['kind'] == 'glitch']) == 1)
+tracker.flush(now + 10.0)
+logged = [e for e in app.event_log.snapshot() if e['kind'] == 'glitch']
+check("flush after window emits one summary", len(logged) == 2)
+check("summary includes pending count and total",
+      "5 more" in logged[0]['message'] and "total 6" in logged[0]['message'],
+      logged[0]['message'])
+stats = tracker.stats()
+check("stats: count=6, max duration 30ms",
+      stats['count'] == 6 and abs(stats['max_duration_ms'] - 30.0) < 0.5,
+      str(stats))
 
 print("Pin/chip validation:")
 check("pin 17 valid", app._validate_bcm_pin(17) == 17)
