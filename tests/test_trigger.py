@@ -268,44 +268,85 @@ out = deb.edge(0, 0.01) + deb.edge(1, 0.02)
 check("edge bounce before baseline produces no glitch records",
       all(e['kind'] != 'glitch' for e in out), str(out))
 
-print("BurstDetector (trigger_mode='burst', chattering lines):")
-b = app.BurstDetector(5, 0.2, 1.0)
-hits = [h for h in (b.edge(1.0 + i * 0.005) for i in range(10)) if h]
-check("shower of 10 edges fires exactly once, at the 5th edge",
-      len(hits) == 1 and hits[0]['edges'] == 5 and abs(hits[0]['at'] - 1.02) < 1e-9,
-      str(hits))
-more = [h for h in (b.edge(1.06 + i * 0.01) for i in range(30)) if h]
-check("continued shower (30 more edges) does not refire", len(more) == 0)
-again = [h for h in (b.edge(3.0 + i * 0.005) for i in range(6)) if h]
-check("new shower after 1s of quiet fires again", len(again) == 1)
+print("BurstDetector (accumulated time away from idle):")
+IDLE = 0  # line idles LOW, excursions go HIGH (the field rig)
 
-b = app.BurstDetector(5, 0.2, 1.0)
-check("4 edges never fire",
-      not any(b.edge(1.0 + i * 0.01) for i in range(4)))
-b = app.BurstDetector(5, 0.2, 1.0)
-check("5 slow edges (0.5s apart) never fire — window prunes",
-      not any(b.edge(1.0 + i * 0.5) for i in range(5)))
 
-# Field-data shape: ~each actuation = dozens of sub-ms pulses (2 edges each)
-# clumped within ~100ms, showers separated by seconds.
-b = app.BurstDetector(5, 0.2, 1.0)
-fired = 0
-for press in range(3):
-    t0 = 10.0 + press * 5.0
-    for i in range(40):  # 20 blips = 40 edges within ~80ms
-        if b.edge(t0 + i * 0.002):
-            fired += 1
-check("three real-world chatter showers 5s apart fire exactly 3 times",
-      fired == 3, str(fired))
+def blips(b, blip_list, idle=IDLE, tick_every=0.02, tail=2.0):
+    """Feed (start, width) HIGH blips as edge pairs with periodic ticks.
+    Returns list of fire events."""
+    hits = []
+    events = []
+    for s, w in blip_list:
+        events.append((1, s))
+        events.append((0, s + w))
+    events.sort(key=lambda e: e[1])
+    t = 0.0
+    end = (events[-1][1] if events else 0.0) + tail
+    i = 0
+    while t <= end:
+        while i < len(events) and events[i][1] <= t:
+            level, ts = events[i]
+            h = b.ingest(level, ts, idle)
+            if h:
+                hits.append(h)
+            i += 1
+        h = b.tick(t, idle)
+        if h:
+            hits.append(h)
+        t = round(t + tick_every, 6)
+    return hits
 
-check("burst min edges clamps: 2 ok", app._clamp_burst_min_edges(2) == 2)
-for bad in (1, 101, "x"):
+
+# The 20:52 field log: loading/unloading chatter = ~200 blips of ~50µs
+# over 10s. Must NEVER fire (this fired falsely under edge counting).
+b = app.BurstDetector(0.010, 0.5, 1.0)
+ambient = [(10.0 + i * 0.05, 0.00005) for i in range(200)]
+check("field ambient chatter (200x 50µs over 10s) never fires",
+      blips(b, ambient) == [], "fired!")
+
+# Even with the occasional wider blip pair seen in the log (3.6ms), stays quiet.
+b = app.BurstDetector(0.010, 0.5, 1.0)
+mixed = ambient[:50] + [(11.0, 0.0036), (11.2, 0.0036)] + ambient[50:]
+check("ambient + two 3.6ms blips still under 10ms threshold",
+      blips(b, mixed) == [])
+
+# A real actuation carries signal mass: e.g. eight 2ms excursions in 300ms.
+b = app.BurstDetector(0.010, 0.5, 1.0)
+press = [(10.0 + i * 0.04, 0.002) for i in range(8)]
+hits = blips(b, press)
+check("actuation shower (8x 2ms in 300ms = 16ms mass) fires exactly once",
+      len(hits) == 1 and hits[0]['high_ms'] >= 10.0, str(hits))
+
+# One clean sustained pulse (post-pull-up future) fires via tick mid-pulse.
+b = app.BurstDetector(0.010, 0.5, 1.0)
+hits = blips(b, [(10.0, 0.5)])
+check("clean 500ms pulse fires once, ~10ms after it starts",
+      len(hits) == 1 and 10.0 <= hits[0]['at'] <= 10.05, str(hits))
+
+# Long chatter storm fires once, then re-arms only after quiet.
+b = app.BurstDetector(0.010, 0.5, 1.0)
+storm = [(10.0 + i * 0.03, 0.003) for i in range(100)]   # 3s of dense 3ms blips
+second = [(20.0 + i * 0.04, 0.002) for i in range(8)]     # separate press later
+hits = blips(b, storm + second)
+check("3s chatter storm fires once; separate press after quiet fires again",
+      len(hits) == 2, str(len(hits)))
+
+# Old-code equivalence: anything the 50ms sampler could reliably catch
+# (tens of ms of accumulated HIGH) fires deterministically here.
+b = app.BurstDetector(0.010, 0.5, 1.0)
+dispatch = [(10.0 + i * 0.01, 0.004) for i in range(20)]  # 80ms mass in 200ms
+check("dispatch-class signal (80ms mass) fires",
+      len(blips(b, dispatch)) == 1)
+
+check("burst threshold clamp: 5ms ok", app._clamp_burst_high_time(0.005) == 0.005)
+for bad in (0.0001, 2.0, "x"):
     try:
-        app._clamp_burst_min_edges(bad)
-        raise AssertionError(f"FAIL: burst_min_edges {bad!r} accepted")
+        app._clamp_burst_high_time(bad)
+        raise AssertionError(f"FAIL: burst_high_time {bad!r} accepted")
     except (TypeError, ValueError):
         passed += 1
-        print(f"  ok - burst_min_edges {bad!r} rejected")
+        print(f"  ok - burst_high_time {bad!r} rejected")
 check("burst window clamps low", app._clamp_burst_window(0.001) == 0.02)
 check("burst window clamps high", app._clamp_burst_window(60) == 5.0)
 check("burst quiet clamps", app._clamp_burst_quiet(0.01) == 0.1
