@@ -849,7 +849,11 @@
             const backendEl = document.getElementById('diag-backend');
             if (data.gpio_ready && data.gpio_lib) {
                 const chip = (data.gpio_chip || '').replace('/dev/', '');
-                backendEl.textContent = data.gpio_lib + (chip ? ' @ ' + chip : '');
+                backendEl.textContent = data.gpio_lib + (chip ? ' @ ' + chip : '')
+                    + (data.gpio_edge_mode ? ' · edge' : ' · poll');
+                backendEl.title = data.gpio_edge_mode
+                    ? 'Kernel edge detection: every pulse is captured with exact timestamps, regardless of width'
+                    : 'Polling mode: pulses shorter than the sampling interval may be missed';
                 backendEl.className = 'status-value online';
                 backendEl.style.fontSize = '13px';
             } else if (data.gpio_available) {
