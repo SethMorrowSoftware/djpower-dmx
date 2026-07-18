@@ -111,6 +111,22 @@ class Config:
     #             wiring: line idles LOW/closed and lifts on trigger)
     # Changeable at runtime from the web UI and persisted to disk.
     TRIGGER_ON = 'close'
+    # How the trigger is detected (edge-detection backend only):
+    #   'level' - a debounced stable level change fires (default; needs the
+    #             line to actually reach and hold the firing level)
+    #   'burst' - a shower of raw edges fires. For electrically marginal
+    #             lines that chatter across the logic threshold instead of
+    #             switching cleanly (weak pull-up vs. long/loaded cable):
+    #             each physical actuation produces a burst of brief edges
+    #             rather than one clean pulse. Fires when BURST_MIN_EDGES
+    #             raw edges (either direction) land within BURST_WINDOW,
+    #             then re-arms only after BURST_QUIET_REARM of silence, so
+    #             one actuation fires exactly once. TRIGGER_ON polarity is
+    #             ignored in burst mode.
+    TRIGGER_MODE = 'level'
+    BURST_MIN_EDGES = 5
+    BURST_WINDOW = 0.2  # seconds
+    BURST_QUIET_REARM = 1.0  # seconds
     # Hardware safety-switch interlock on SAFETY_SWITCH_PIN. When disabled,
     # the controller operates as if the switch were ON (useful when pin 27
     # is not actually wired to a switch, or while diagnosing wiring).
@@ -249,6 +265,27 @@ def _clamp_debounce_time(value):
     return max(0.0, min(30.0, value))
 
 
+def _clamp_burst_min_edges(value):
+    edges = int(value)
+    if not (2 <= edges <= 100):
+        raise ValueError("burst_min_edges must be between 2 and 100")
+    return edges
+
+
+def _clamp_burst_window(value):
+    v = float(value)
+    if v != v:
+        raise ValueError("NaN")
+    return max(0.02, min(5.0, v))
+
+
+def _clamp_burst_quiet(value):
+    v = float(value)
+    if v != v:
+        raise ValueError("NaN")
+    return max(0.1, min(30.0, v))
+
+
 def _validate_bcm_pin(value):
     """Validate a header GPIO as a BCM number (2-27; 0/1 are HAT EEPROM)."""
     pin = int(value)
@@ -280,8 +317,12 @@ def save_config():
         data = {
             'scene_b_duration': config.SCENE_B_DURATION,
             'trigger_on': config.TRIGGER_ON,
+            'trigger_mode': config.TRIGGER_MODE,
             'trigger_hold_time': config.TRIGGER_HOLD_TIME,
             'debounce_time': config.DEBOUNCE_TIME,
+            'burst_min_edges': config.BURST_MIN_EDGES,
+            'burst_window': config.BURST_WINDOW,
+            'burst_quiet_rearm': config.BURST_QUIET_REARM,
             'safety_switch_enabled': config.SAFETY_SWITCH_ENABLED,
             'contact_pin': config.CONTACT_PIN,
             'safety_switch_pin': config.SAFETY_SWITCH_PIN,
@@ -320,6 +361,17 @@ def load_config():
             config.SCENE_B_DURATION = float(data['scene_b_duration'])
         if data.get('trigger_on') in ('close', 'open'):
             config.TRIGGER_ON = data['trigger_on']
+        if data.get('trigger_mode') in ('level', 'burst'):
+            config.TRIGGER_MODE = data['trigger_mode']
+        for key, clamp, attr in (
+                ('burst_min_edges', _clamp_burst_min_edges, 'BURST_MIN_EDGES'),
+                ('burst_window', _clamp_burst_window, 'BURST_WINDOW'),
+                ('burst_quiet_rearm', _clamp_burst_quiet, 'BURST_QUIET_REARM')):
+            if key in data:
+                try:
+                    setattr(config, attr, clamp(data[key]))
+                except (TypeError, ValueError):
+                    pass
         if 'trigger_hold_time' in data:
             try:
                 config.TRIGGER_HOLD_TIME = _clamp_hold_time(float(data['trigger_hold_time']))
@@ -906,6 +958,45 @@ class EdgeDebouncer:
         return None
 
 
+class BurstDetector:
+    """Fires on showers of raw kernel edges (trigger mode 'burst').
+
+    Field signature this handles: an electrically marginal line (weak
+    pull-up against long/loaded cable) never switches cleanly — each
+    physical actuation produces hundreds of microsecond-scale edges
+    chattering across the logic threshold instead of one clean pulse.
+    The shower itself becomes the trigger: min_edges raw edges within
+    window fire once, and re-arming requires quiet_rearm seconds of
+    silence first, so a long shower still fires exactly once.
+    """
+
+    def __init__(self, min_edges, window, quiet_rearm):
+        self.min_edges = min_edges
+        self.window = window
+        self.quiet_rearm = quiet_rearm
+        self.reset()
+
+    def reset(self):
+        self._times = deque()
+        self._armed = True
+        self._last_edge = None
+
+    def edge(self, ts):
+        """Feed one raw edge timestamp. Returns burst info when firing."""
+        if (self._last_edge is not None
+                and (ts - self._last_edge) >= self.quiet_rearm):
+            self._armed = True
+            self._times.clear()
+        self._last_edge = ts
+        self._times.append(ts)
+        while self._times and (ts - self._times[0]) > self.window:
+            self._times.popleft()
+        if self._armed and len(self._times) >= self.min_edges:
+            self._armed = False
+            return {'edges': len(self._times), 'span': ts - self._times[0], 'at': ts}
+        return None
+
+
 def _normalize_gpiochip_id(chip_id):
     if chip_id is None:
         return None
@@ -1329,6 +1420,10 @@ def api_status():
         'contact_pin': config.CONTACT_PIN,
         'safety_switch_pin': config.SAFETY_SWITCH_PIN,
         'trigger_on': config.TRIGGER_ON,
+        'trigger_mode': config.TRIGGER_MODE,
+        'burst_min_edges': config.BURST_MIN_EDGES,
+        'burst_window': config.BURST_WINDOW,
+        'burst_quiet_rearm': config.BURST_QUIET_REARM,
         'trigger_hold_time': config.TRIGGER_HOLD_TIME,
         'debounce_time': config.DEBOUNCE_TIME,
         'safety_switch_enabled': config.SAFETY_SWITCH_ENABLED,
@@ -1475,6 +1570,32 @@ def api_config():
                     f"Trigger polarity set to fire on contact {config.TRIGGER_ON.upper()}",
                 )
 
+        # Trigger detection mode: debounced level change vs raw edge burst
+        if 'trigger_mode' in data:
+            if data['trigger_mode'] not in ('level', 'burst'):
+                return jsonify({'error': "trigger_mode must be 'level' or 'burst'"}), 400
+            if data['trigger_mode'] != config.TRIGGER_MODE:
+                config.TRIGGER_MODE = data['trigger_mode']
+                event_log.add(
+                    'config',
+                    "Trigger detection set to "
+                    + ("EDGE BURST (fires on showers of raw edges)"
+                       if config.TRIGGER_MODE == 'burst'
+                       else "LEVEL (fires on debounced state change)"),
+                )
+
+        # Burst-mode tuning
+        for key, clamp, attr, label in (
+                ('burst_min_edges', _clamp_burst_min_edges, 'BURST_MIN_EDGES', 'min edges'),
+                ('burst_window', _clamp_burst_window, 'BURST_WINDOW', 'window'),
+                ('burst_quiet_rearm', _clamp_burst_quiet, 'BURST_QUIET_REARM', 're-arm quiet')):
+            if key in data:
+                try:
+                    setattr(config, attr, clamp(data[key]))
+                except (TypeError, ValueError) as e:
+                    return jsonify({'error': f'Invalid {key}: {e}'}), 400
+                event_log.add('config', f"Burst {label} set to {getattr(config, attr)}")
+
         # Glitch-filter window and post-trigger cooldown
         if 'trigger_hold_time' in data:
             try:
@@ -1550,8 +1671,12 @@ def api_config():
             'safety_switch_pin': config.SAFETY_SWITCH_PIN,
             'gpio_chip': str(config.GPIO_CHIP) if config.GPIO_CHIP is not None else None,
             'trigger_on': config.TRIGGER_ON,
+            'trigger_mode': config.TRIGGER_MODE,
             'trigger_hold_time': config.TRIGGER_HOLD_TIME,
             'debounce_time': config.DEBOUNCE_TIME,
+            'burst_min_edges': config.BURST_MIN_EDGES,
+            'burst_window': config.BURST_WINDOW,
+            'burst_quiet_rearm': config.BURST_QUIET_REARM,
             'safety_switch_enabled': config.SAFETY_SWITCH_ENABLED,
         })
 
@@ -1602,8 +1727,24 @@ def gpio_fire_level():
     return 0 if config.TRIGGER_ON == 'close' else 1
 
 
-def _apply_contact_event(evt, now, trigger_ctx):
-    """Handle one debounced contact-line event (shared by both monitor modes)."""
+def _fire_gpio_trigger(now, trigger_ctx, detail=None):
+    """Fire the sequence from a GPIO detection, honoring the cooldown."""
+    last = trigger_ctx.get('last_trigger_time')
+    if last is None or (now - last) >= config.DEBOUNCE_TIME:
+        trigger_ctx['last_trigger_time'] = now
+        if detail:
+            event_log.add('contact', detail)
+        trigger_sequence(source='gpio')
+    else:
+        event_log.add('trigger', "GPIO trigger suppressed (cooldown active)")
+
+
+def _apply_contact_event(evt, now, trigger_ctx, fire=True):
+    """Handle one debounced contact-line event (shared by both monitor modes).
+
+    fire=False records transitions/glitches for diagnostics without firing
+    the sequence — used while burst mode owns the trigger decision.
+    """
     if evt['kind'] == 'glitch':
         state.glitch_trackers['contact'].record(evt, now)
         return
@@ -1615,13 +1756,8 @@ def _apply_contact_event(evt, now, trigger_ctx):
         f"Contact {_level_text(evt['to'])} "
         f"(was {_level_text(evt['from'])} for {_fmt_duration(evt['prev_duration'])})",
     )
-    if evt['to'] == gpio_fire_level():
-        last = trigger_ctx.get('last_trigger_time')
-        if last is None or (now - last) >= config.DEBOUNCE_TIME:
-            trigger_ctx['last_trigger_time'] = now
-            trigger_sequence(source='gpio')
-        else:
-            event_log.add('trigger', "GPIO trigger suppressed (cooldown active)")
+    if fire and evt['to'] == gpio_fire_level():
+        _fire_gpio_trigger(now, trigger_ctx)
 
 
 def _apply_safety_event(evt, now):
@@ -1663,10 +1799,14 @@ def _gpio_monitor():
     safety = LineMonitor('safety', config.TRIGGER_HOLD_TIME)
     e_contact = EdgeDebouncer('contact', config.TRIGGER_HOLD_TIME)
     e_safety = EdgeDebouncer('safety', config.TRIGGER_HOLD_TIME)
+    burst = BurstDetector(config.BURST_MIN_EDGES, config.BURST_WINDOW,
+                          config.BURST_QUIET_REARM)
     trigger_ctx = {'last_trigger_time': None}
     last_good_read = None
     consecutive_errors = 0
     max_errors_before_reinit = 3
+    edge_seeded = False
+    burst_fallback_warned = False
 
     while True:
         try:
@@ -1676,19 +1816,27 @@ def _gpio_monitor():
                     safety.reset()
                     e_contact.reset()
                     e_safety.reset()
+                    burst.reset()
                     last_good_read = None
-                    if state.gpio_edge_mode:
-                        # Latch startup baselines from a direct read.
-                        now = time.monotonic()
-                        evt = e_contact.seed(check_contact_state(), now)
-                        if evt is not None:
-                            _apply_contact_event(evt, now, trigger_ctx)
-                        evt = e_safety.seed(check_safety_switch_state(), now)
-                        if evt is not None:
-                            _apply_safety_event(evt, now)
+                    edge_seeded = False
+                    burst_fallback_warned = False
                 else:
                     time.sleep(5.0)
                     continue
+
+            # Latch startup baselines from a direct read. GPIO is usually
+            # initialized by _initialize() before this thread starts, so
+            # seeding must happen here on the first pass, not only after a
+            # monitor-driven re-init.
+            if state.gpio_edge_mode and not edge_seeded:
+                edge_seeded = True
+                now = time.monotonic()
+                evt = e_contact.seed(check_contact_state(), now)
+                if evt is not None:
+                    _apply_contact_event(evt, now, trigger_ctx)
+                evt = e_safety.seed(check_safety_switch_state(), now)
+                if evt is not None:
+                    _apply_safety_event(evt, now)
 
             # Pick up runtime config changes made from the web UI. The
             # safety toggle keeps a stability floor so a near-zero glitch
@@ -1697,8 +1845,21 @@ def _gpio_monitor():
             contact.stable_time = e_contact.stable_time = config.TRIGGER_HOLD_TIME
             safety.stable_time = e_safety.stable_time = safety_stable
 
+            burst_mode = config.TRIGGER_MODE == 'burst'
+            if burst_mode and not state.gpio_edge_mode and not burst_fallback_warned:
+                burst_fallback_warned = True
+                event_log.add(
+                    'gpio',
+                    "Burst trigger mode needs kernel edge detection; this backend "
+                    "is polling — falling back to level detection",
+                )
+
             if state.gpio_edge_mode:
                 # --- kernel edge-event mode ---
+                burst.min_edges = config.BURST_MIN_EDGES
+                burst.window = config.BURST_WINDOW
+                burst.quiet_rearm = config.BURST_QUIET_REARM
+
                 have_events = state.gpio_line.wait_edge_events(0.02)
                 now = time.monotonic()
                 if have_events:
@@ -1706,14 +1867,22 @@ def _gpio_monitor():
                         level = 1 if ev.event_type == gpiod.EdgeEvent.Type.RISING_EDGE else 0
                         ts = ev.timestamp_ns / 1e9
                         if ev.line_offset == config.CONTACT_PIN:
+                            hit = burst.edge(ts)
+                            if burst_mode and hit is not None:
+                                _fire_gpio_trigger(
+                                    now, trigger_ctx,
+                                    detail=(f"Edge burst detected: {hit['edges']} edges "
+                                            f"in {hit['span'] * 1000:.0f}ms"),
+                                )
                             for evt in e_contact.edge(level, ts):
-                                _apply_contact_event(evt, now, trigger_ctx)
+                                _apply_contact_event(evt, now, trigger_ctx,
+                                                     fire=not burst_mode)
                         else:
                             for evt in e_safety.edge(level, ts):
                                 _apply_safety_event(evt, now)
                 evt = e_contact.tick(now)
                 if evt is not None:
-                    _apply_contact_event(evt, now, trigger_ctx)
+                    _apply_contact_event(evt, now, trigger_ctx, fire=not burst_mode)
                 evt = e_safety.tick(now)
                 if evt is not None:
                     _apply_safety_event(evt, now)
