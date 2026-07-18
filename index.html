@@ -402,6 +402,44 @@
         .card:first-child {
             border-top: 3px solid #3b82f6;
         }
+
+        /* GPIO diagnostics */
+        .event-log {
+            background: #0f0f14;
+            border: 1px solid #2a2a3a;
+            border-radius: 8px;
+            padding: 10px 12px;
+            max-height: 220px;
+            overflow-y: auto;
+            font-family: 'SF Mono', 'Consolas', monospace;
+            font-size: 12px;
+            line-height: 1.7;
+        }
+        .event-row { display: flex; gap: 10px; }
+        .event-ts { color: #71717a; flex-shrink: 0; }
+        .event-kind {
+            flex-shrink: 0;
+            width: 58px;
+            text-transform: uppercase;
+            font-weight: 700;
+            font-size: 10px;
+            letter-spacing: 0.5px;
+            padding-top: 2px;
+        }
+        .event-kind.trigger { color: #22c55e; }
+        .event-kind.contact { color: #3b82f6; }
+        .event-kind.safety  { color: #eab308; }
+        .event-kind.gpio    { color: #a1a1aa; }
+        .event-kind.config  { color: #a855f7; }
+        .event-msg { color: #e4e4e7; word-break: break-word; }
+        .diag-hint { font-size: 12px; color: #71717a; margin-top: 8px; }
+        .inline-controls {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            align-items: end;
+        }
+        .toggle-row { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
     </style>
 </head>
 <body>
@@ -499,7 +537,74 @@
                 </div>
             </div>
         </div>
-        
+
+        <!-- GPIO Trigger & Diagnostics -->
+        <div class="card">
+            <h2>🔌 GPIO Trigger &amp; Diagnostics</h2>
+
+            <div class="status-grid">
+                <div class="status-item">
+                    <div class="status-label">Contact Line (GPIO 17)</div>
+                    <div class="status-value" id="diag-contact" style="font-size: 14px; padding-top: 3px;">—</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Safety Line (GPIO 27)</div>
+                    <div class="status-value" id="diag-safety" style="font-size: 14px; padding-top: 3px;">—</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">GPIO Backend</div>
+                    <div class="status-value" id="diag-backend" style="font-size: 13px; padding-top: 4px;">—</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Triggers</div>
+                    <div class="status-value" id="diag-trigger-count">0</div>
+                </div>
+                <div class="status-item">
+                    <div class="status-label">Last Trigger</div>
+                    <div class="status-value" id="diag-last-trigger" style="font-size: 13px; padding-top: 4px;">never</div>
+                </div>
+            </div>
+
+            <div class="inline-controls">
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label for="trigger-on">Trigger Fires When Contact…</label>
+                    <select id="trigger-on">
+                        <option value="close">CLOSES to GND (normally-open wiring)</option>
+                        <option value="open">OPENS (normally-closed / inverted wiring)</option>
+                    </select>
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label for="hold-ms">Glitch Filter (ms)</label>
+                    <input type="number" id="hold-ms" min="20" max="2000" step="10" value="50">
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label for="cooldown-s">Trigger Cooldown (s)</label>
+                    <input type="number" id="cooldown-s" min="0" max="30" step="0.1" value="0.3">
+                </div>
+                <button class="btn-primary" onclick="saveTriggerSettings()" style="height: 46px;">
+                    Save Trigger Settings
+                </button>
+            </div>
+            <div class="diag-hint" id="trigger-hint"></div>
+
+            <div class="toggle-row">
+                <input type="checkbox" id="safety-enabled" checked onchange="toggleSafetyInterlock(this)"
+                       style="width: 18px; height: 18px; accent-color: #3b82f6; cursor: pointer;">
+                <label for="safety-enabled" style="margin-bottom: 0; cursor: pointer;">
+                    Hardware safety-switch interlock (GPIO 27)
+                </label>
+            </div>
+            <div class="diag-hint">
+                When disabled, the controller operates as if the safety switch were ON.
+                Disable only if pin 27 is not wired to a real switch.
+            </div>
+
+            <div class="form-group" style="margin-top: 16px; margin-bottom: 0;">
+                <label>Event Log <span style="text-transform: none; letter-spacing: 0;">(live — line transitions, triggers, GPIO state)</span></label>
+                <div class="event-log" id="event-log">Waiting for events…</div>
+            </div>
+        </div>
+
         <!-- Advanced Controls -->
         <div class="card">
             <h2>🎨 LED Controls</h2>
@@ -658,7 +763,10 @@
                     const contactText = {'open': 'OPEN', 'closed': 'CLOSED'}[data.contact_state] || '—';
                     document.getElementById('contact-state').textContent = contactText;
 
-                    const safetyText = {'on': 'SAFE', 'off': 'LOCK'}[data.safety_switch_state] || '—';
+                    let safetyText = {'on': 'SAFE', 'off': 'LOCK'}[data.safety_switch_state] || '—';
+                    if (data.safety_switch_enabled === false) {
+                        safetyText = 'BYPASS';
+                    }
                     const safetyEl = document.getElementById('safety-switch-state');
                     safetyEl.textContent = safetyText;
                     safetyEl.className = 'status-value ' + (data.safe_to_operate ? 'online' : 'offline');
@@ -667,17 +775,19 @@
                     triggerBtn.disabled = !data.safe_to_operate;
                     triggerBtn.style.opacity = data.safe_to_operate ? '1' : '0.5';
                     triggerBtn.title = data.safe_to_operate ? '' : 'Safety switch is OFF';
-                    
+
                     // Update current channels
                     if (data.channels) {
                         currentChannels = data.channels;
                         updateSliderDisplays();
                     }
-                    
-                    // Update trigger duration display
-                    if (data.scene_b_duration) {
+
+                    // Update trigger duration display (not while being edited)
+                    if (data.scene_b_duration && document.activeElement !== document.getElementById('trigger-duration')) {
                         document.getElementById('trigger-duration').value = data.scene_b_duration;
                     }
+
+                    updateDiagnostics(data);
                 })
                 .catch(error => {
                     console.error('Status poll error:', error);
@@ -691,6 +801,153 @@
                 });
         }
         
+        function updateDiagnostics(data) {
+            // Live line levels (raw, debounce-independent)
+            const lineText = {'closed': 'LOW · closed', 'open': 'HIGH · open'};
+            document.getElementById('diag-contact').textContent = lineText[data.contact_state] || 'unreadable';
+            document.getElementById('diag-safety').textContent = lineText[data.safety_switch_state === 'on' ? 'closed' : data.safety_switch_state === 'off' ? 'open' : 'unknown'] || 'unreadable';
+
+            // GPIO backend
+            const backendEl = document.getElementById('diag-backend');
+            if (data.gpio_ready && data.gpio_lib) {
+                const chip = (data.gpio_chip || '').replace('/dev/', '');
+                backendEl.textContent = data.gpio_lib + (chip ? ' @ ' + chip : '');
+                backendEl.className = 'status-value online';
+                backendEl.style.fontSize = '13px';
+            } else if (data.gpio_available) {
+                backendEl.textContent = 'INIT FAILED';
+                backendEl.className = 'status-value offline';
+            } else {
+                backendEl.textContent = 'N/A';
+                backendEl.className = 'status-value';
+            }
+
+            // Trigger counters
+            document.getElementById('diag-trigger-count').textContent = data.trigger_count ?? '0';
+            const lastEl = document.getElementById('diag-last-trigger');
+            if (data.last_trigger && data.last_trigger.ts) {
+                const when = new Date(data.last_trigger.ts * 1000).toLocaleTimeString();
+                lastEl.textContent = when + ' · ' + (data.last_trigger.source || '?');
+            } else {
+                lastEl.textContent = 'never';
+            }
+
+            // Settings widgets (don't clobber while user is editing)
+            const triggerOnEl = document.getElementById('trigger-on');
+            if (data.trigger_on && document.activeElement !== triggerOnEl) {
+                triggerOnEl.value = data.trigger_on;
+            }
+            const holdEl = document.getElementById('hold-ms');
+            if (data.trigger_hold_time && document.activeElement !== holdEl) {
+                holdEl.value = Math.round(data.trigger_hold_time * 1000);
+            }
+            const cooldownEl = document.getElementById('cooldown-s');
+            if (data.debounce_time !== undefined && document.activeElement !== cooldownEl) {
+                cooldownEl.value = data.debounce_time;
+            }
+            if (data.safety_switch_enabled !== undefined) {
+                document.getElementById('safety-enabled').checked = data.safety_switch_enabled;
+            }
+
+            // Plain-language explanation of the current trigger config,
+            // including a warning when the line is parked at the firing level.
+            const firing = data.trigger_on === 'open' ? 'open' : 'closed';
+            let hint = 'Fires when the contact line settles ' +
+                (firing === 'closed' ? 'LOW (closed to GND)' : 'HIGH (open)') +
+                ' for ' + Math.round((data.trigger_hold_time || 0.05) * 1000) + 'ms. ' +
+                'Cooldown ' + (data.debounce_time ?? 0.3) + 's between triggers.';
+            if (data.contact_state === firing) {
+                hint += ' ⚠ Contact is currently AT the firing level — it must leave that state and return before another trigger can fire.';
+            }
+            document.getElementById('trigger-hint').textContent = hint;
+        }
+
+        function saveTriggerSettings() {
+            const body = {
+                trigger_on: document.getElementById('trigger-on').value,
+                trigger_hold_time: parseFloat(document.getElementById('hold-ms').value) / 1000,
+                debounce_time: parseFloat(document.getElementById('cooldown-s').value),
+            };
+            fetch('/api/config', {
+                method: 'POST',
+                headers: getApiHeaders(),
+                body: JSON.stringify(body)
+            })
+            .then(response => response.json().then(data => ({ok: response.ok, data})))
+            .then(({ok, data}) => {
+                if (!ok) throw new Error(data.error || 'Save failed');
+                showToast('✅ Trigger settings saved');
+                updateStatus();
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showToast(`❌ ${error.message || 'Error saving trigger settings'}`, true);
+            });
+        }
+
+        function toggleSafetyInterlock(el) {
+            if (!el.checked && !confirm(
+                    'Disable the hardware safety-switch interlock?\n\n' +
+                    'The controller will operate as if the safety switch were ON. ' +
+                    'Only do this if GPIO 27 is not wired to a real safety switch.')) {
+                el.checked = true;
+                return;
+            }
+            fetch('/api/config', {
+                method: 'POST',
+                headers: getApiHeaders(),
+                body: JSON.stringify({safety_switch_enabled: el.checked})
+            })
+            .then(response => response.json().then(data => ({ok: response.ok, data})))
+            .then(({ok, data}) => {
+                if (!ok) throw new Error(data.error || 'Update failed');
+                showToast(el.checked ? '✅ Safety interlock enabled' : '⚠ Safety interlock bypassed');
+                updateStatus();
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                el.checked = !el.checked;
+                showToast(`❌ ${error.message || 'Error updating interlock'}`, true);
+            });
+        }
+
+        function updateEvents() {
+            fetch('/api/events', {headers: getApiHeaders()})
+                .then(response => {
+                    if (!response.ok) throw new Error('Events request failed');
+                    return response.json();
+                })
+                .then(data => {
+                    const logEl = document.getElementById('event-log');
+                    const events = data.events || [];
+                    if (!events.length) {
+                        logEl.textContent = 'No events yet.';
+                        return;
+                    }
+                    // Preserve scroll position unless pinned to the top (newest first)
+                    const pinned = logEl.scrollTop < 8;
+                    logEl.replaceChildren(...events.map(evt => {
+                        const row = document.createElement('div');
+                        row.className = 'event-row';
+                        const ts = document.createElement('span');
+                        ts.className = 'event-ts';
+                        ts.textContent = new Date(evt.ts * 1000).toLocaleTimeString();
+                        const kind = document.createElement('span');
+                        kind.className = 'event-kind ' + (evt.kind || '');
+                        kind.textContent = evt.kind || '';
+                        const msg = document.createElement('span');
+                        msg.className = 'event-msg';
+                        msg.textContent = evt.message || '';
+                        row.append(ts, kind, msg);
+                        return row;
+                    }));
+                    if (pinned) logEl.scrollTop = 0;
+                })
+                .catch(error => console.error('Events poll error:', error));
+        }
+        const eventsInterval = setInterval(updateEvents, 2000);
+        updateEvents();
+
         function updateSliderDisplays() {
             const sliderMap = {
                 'fog': ['fog-value', 'fog'],
