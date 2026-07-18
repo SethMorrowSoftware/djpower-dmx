@@ -183,6 +183,91 @@ check("boot with line LOW and 0 filter still never self-fires",
       sweep(inverted([]), 'open', hold=0.0) == {0} and
       sweep(inverted([]), 'close', hold=0.0) == {0})
 
+print("EdgeDebouncer (kernel edge-event mode):")
+
+
+def edge_run(seq, hold, seed_level=0, trigger_on='open', tick_every=0.02, until=None):
+    """Feed (level, ts) kernel edges through EdgeDebouncer with periodic
+    ticks, replicating the monitor's fire decision. Returns
+    (fires, transitions, glitches)."""
+    deb = app.EdgeDebouncer('contact', hold)
+    fire_level = 0 if trigger_on == 'close' else 1
+    fires, transitions, glitches = [], [], []
+    last_fire = None
+
+    def handle(evt, now):
+        nonlocal last_fire
+        if evt['kind'] == 'glitch':
+            glitches.append(evt)
+        elif evt['from'] is not None:
+            transitions.append(evt)
+            if evt['to'] == fire_level:
+                if last_fire is None or (now - last_fire) >= COOLDOWN:
+                    last_fire = now
+                    fires.append(round(evt['at'], 6))
+
+    evt = deb.seed(seed_level, 0.0)
+    assert evt is not None and evt['from'] is None  # baseline, never a fire
+    end = until if until is not None else (seq[-1][1] + 1.0 if seq else 1.0)
+    t = 0.0
+    i = 0
+    while t <= end:
+        while i < len(seq) and seq[i][1] <= t:
+            level, ts = seq[i]
+            for e in deb.edge(level, ts):
+                handle(e, t)
+            i += 1
+        e = deb.tick(t)
+        if e is not None:
+            handle(e, t)
+        t = round(t + tick_every, 6)
+    return fires, transitions, glitches
+
+
+# Their rig: line idles LOW, controller emits short HIGH pulses.
+fires, trans, gl = edge_run([(1, 1.0), (0, 1.005)], hold=0.002)
+check("5ms pulse fires with 2ms filter (edge mode)",
+      fires == [1.0] and len(gl) == 0, f"fires={fires} glitches={gl}")
+fires, trans, gl = edge_run([(1, 1.0), (0, 1.0005)], hold=0.002)
+check("0.5ms pulse rejected by 2ms filter with EXACT width",
+      fires == [] and len(gl) == 1 and abs(gl[0]['duration'] - 0.0005) < 1e-12,
+      f"glitch width {gl[0]['duration'] if gl else '-'}")
+fires, trans, gl = edge_run([(1, 1.0), (0, 1.0005)], hold=0.0)
+check("0.5ms pulse FIRES with 0 filter (kernel latched, never missed)",
+      fires == [1.0], str(fires))
+fires, trans, gl = edge_run([(1, 1.0), (0, 1.2)], hold=0.05)
+check("held 200ms pulse fires once via tick commit",
+      fires == [1.0] and [t['to'] for t in trans] == [1, 0], str(fires))
+fires, trans, gl = edge_run([(1, 1.0), (0, 1.005), (1, 2.0), (0, 2.005)], hold=0.002)
+check("two 5ms pulses 1s apart fire twice", fires == [1.0, 2.0], str(fires))
+fires, trans, gl = edge_run([(1, 1.0), (0, 1.005), (1, 1.1), (0, 1.105)], hold=0.002)
+check("second pulse inside 300ms cooldown suppressed", fires == [1.0], str(fires))
+fires, trans, gl = edge_run([(1, 1.0), (1, 1.001), (0, 1.005)], hold=0.002)
+check("duplicate same-direction kernel edge ignored",
+      fires == [1.0] and len(gl) == 0)
+fires, trans, gl = edge_run([(0, 1.0), (1, 1.004), (0, 1.05), (1, 1.051)], hold=0.002,
+                            trigger_on='close', seed_level=1)
+check("close-mode: 4ms LOW pulse fires, later 1ms LOW spike is a glitch",
+      fires == [1.0] and len(gl) == 1 and gl[0]['level'] == 0
+      and abs(gl[0]['duration'] - 0.001) < 1e-12, f"{fires} {gl}")
+
+# Batched delivery: a whole pulse can arrive in one read_edge_events() batch.
+deb = app.EdgeDebouncer('contact', 0.002)
+deb.seed(1, 0.0)
+evts = deb.edge(0, 1.0)
+evts += deb.edge(1, 1.005)  # pulse end + new pending back to idle
+kinds = [e['kind'] for e in evts]
+check("batched pulse commits transition at closing edge",
+      kinds == ['transition'] and evts[0]['to'] == 0 and evts[0]['at'] == 1.0, str(evts))
+evt = deb.tick(1.01)
+check("return-to-idle commits on next tick", evt is not None and evt['to'] == 1)
+
+# Pre-baseline bounce must not glitch-count (unknown resting state).
+deb = app.EdgeDebouncer('x', 0.05)
+out = deb.edge(0, 0.01) + deb.edge(1, 0.02)
+check("edge bounce before baseline produces no glitch records",
+      all(e['kind'] != 'glitch' for e in out), str(out))
+
 print("Config clamps:")
 check("hold time clamps low (0 allowed)", app._clamp_hold_time(-1) == 0.0)
 check("hold time zero passes through", app._clamp_hold_time(0.0) == 0.0)

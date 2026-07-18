@@ -426,7 +426,7 @@ class GlitchTracker:
             level_txt = 'LOW' if evt['level'] == 0 else 'HIGH'
             event_log.add(
                 'glitch',
-                f"Interference on {self.name} line: ~{dur * 1000:.0f}ms {level_txt} "
+                f"Interference on {self.name} line: ~{dur * 1000:.1f}ms {level_txt} "
                 f"pulse rejected by glitch filter (total {self.count})",
             )
             self._last_log_mono = now_mono
@@ -441,7 +441,7 @@ class GlitchTracker:
             event_log.add(
                 'glitch',
                 f"Interference on {self.name} line: {self._pending} more rejected "
-                f"pulses (~{self._pending_min * 1000:.0f}-{self._pending_max * 1000:.0f}ms, "
+                f"pulses (~{self._pending_min * 1000:.1f}-{self._pending_max * 1000:.1f}ms, "
                 f"total {self.count})",
             )
             self._pending = 0
@@ -476,6 +476,7 @@ class SystemState:
         self.gpio_chip = None
         self.gpio_chip_id = None
         self.gpio_ready = False  # Explicit flag for GPIO readiness
+        self.gpio_edge_mode = False  # True when kernel edge events are active
         self.dmx_thread = None
         self.dmx_running = False
         self.enttec_url = None
@@ -814,6 +815,97 @@ class LineMonitor:
         return None
 
 
+class EdgeDebouncer:
+    """Event-driven debouncer fed with exact-timestamped kernel edges.
+
+    Same commit semantics as LineMonitor — a new level must survive
+    stable_time before it becomes the stable level, shorter excursions
+    are reported as glitches — but driven by kernel edge events instead
+    of polling, so no pulse is ever missed regardless of width, and
+    glitch durations are exact rather than poll-resolution estimates.
+
+    edge(level, ts) ingests one kernel edge and returns a LIST of event
+    dicts (possibly empty): a batched pulse can complete a pending
+    commit and open a new one in a single call. tick(now) commits a
+    pending level that has survived stable_time with no opposing edge
+    (a held contact) — call it periodically. seed(level, now) sets the
+    startup baseline, returned as a transition with 'from' = None.
+
+    With stable_time == 0 every edge commits immediately (edge latch);
+    the post-trigger cooldown still limits fire rate downstream.
+    """
+
+    def __init__(self, name, stable_time):
+        self.name = name
+        self.stable_time = stable_time
+        self.reset()
+
+    def reset(self):
+        self.stable_level = None
+        self.stable_since = None
+        self._pending = None
+        self._pending_since = None
+
+    def _commit(self, level, at):
+        prev = self.stable_level
+        prev_duration = None
+        if self.stable_since is not None:
+            prev_duration = at - self.stable_since
+        self.stable_level = level
+        self.stable_since = at
+        self._pending = None
+        self._pending_since = None
+        return {
+            'kind': 'transition',
+            'from': prev,  # None => baseline (startup state), not an edge
+            'to': level,
+            'at': at,
+            'prev_duration': prev_duration,
+        }
+
+    def seed(self, level, now):
+        """Latch the startup level (baseline). Returns its event or None."""
+        if level is None:
+            return None
+        return self._commit(level, now)
+
+    def edge(self, level, ts):
+        """Ingest one kernel edge. Returns a list of event dicts."""
+        events = []
+        if self._pending is not None:
+            if level == self._pending:
+                return events  # duplicate same-direction edge
+            width = ts - self._pending_since
+            if width >= self.stable_time - 1e-9:
+                events.append(self._commit(self._pending, self._pending_since))
+            else:
+                glitch_level = self._pending
+                glitch_since = self._pending_since
+                self._pending = None
+                self._pending_since = None
+                if self.stable_level is not None:
+                    events.append({
+                        'kind': 'glitch',
+                        'level': glitch_level,
+                        'duration': width,
+                        'at': glitch_since,
+                    })
+        if level == self.stable_level:
+            return events
+        self._pending = level
+        self._pending_since = ts
+        if self.stable_time <= 0:
+            events.append(self._commit(level, ts))
+        return events
+
+    def tick(self, now):
+        """Commit a pending level that survived stable_time (held contact)."""
+        if (self._pending is not None
+                and (now - self._pending_since) >= self.stable_time - 1e-9):
+            return self._commit(self._pending, self._pending_since)
+        return None
+
+
 def _normalize_gpiochip_id(chip_id):
     if chip_id is None:
         return None
@@ -851,6 +943,7 @@ def _chip_id_to_path(chip_id):
 
 
 def _open_gpiod_line(chip_id):
+    """Open the GPIO lines. Returns (chip, line(s), edge_mode)."""
     chip_id = _normalize_gpiochip_id(chip_id)
 
     # gpiod v2 API: request_lines takes a path string, not a Chip object
@@ -858,9 +951,39 @@ def _open_gpiod_line(chip_id):
         chip_path = _chip_id_to_path(chip_id)
         direction_enum = getattr(gpiod, "LineDirection", None)
         bias_enum = getattr(gpiod, "LineBias", None)
+        edge_enum = None
         if direction_enum is None and hasattr(gpiod, "line"):
             direction_enum = gpiod.line.Direction
             bias_enum = gpiod.line.Bias
+        if hasattr(gpiod, "line"):
+            edge_enum = getattr(gpiod.line, "Edge", None)
+
+        # Prefer kernel edge detection: edges are latched with exact
+        # timestamps no matter how short the pulse, so sub-poll trigger
+        # pulses (some controllers emit ~5ms) can never be missed.
+        if edge_enum is not None:
+            try:
+                line_settings = gpiod.LineSettings(
+                    direction=direction_enum.INPUT,
+                    bias=bias_enum.PULL_UP,
+                    edge_detection=edge_enum.BOTH,
+                )
+                request = gpiod.request_lines(
+                    chip_path,
+                    consumer="dmx_controller",
+                    config={
+                        config.CONTACT_PIN: line_settings,
+                        config.SAFETY_SWITCH_PIN: line_settings,
+                    },
+                    event_buffer_size=64,
+                )
+                if hasattr(request, "read_edge_events") and hasattr(request, "wait_edge_events"):
+                    return None, request, True
+                # Library too old to deliver events; fall back to polling.
+                request.release()
+            except (TypeError, AttributeError):
+                pass  # older v2 bindings without edge support -> polling
+
         line_settings = gpiod.LineSettings(
             direction=direction_enum.INPUT,
             bias=bias_enum.PULL_UP,
@@ -873,7 +996,7 @@ def _open_gpiod_line(chip_id):
                 config.SAFETY_SWITCH_PIN: line_settings,
             },
         )
-        return None, request  # v2: no separate Chip object needed
+        return None, request, False  # v2: no separate Chip object needed
 
     # gpiod v1 API: create Chip then request the line
     chip = gpiod.Chip(chip_id) if chip_id is not None else None
@@ -890,7 +1013,7 @@ def _open_gpiod_line(chip_id):
             type=gpiod.LINE_REQ_DIR_IN,
             flags=gpiod.LINE_REQ_FLAG_BIAS_PULL_UP,
         )
-        return chip, (contact_line, safety_line)
+        return chip, (contact_line, safety_line), False
     except Exception:
         if chip is not None:
             try:
@@ -951,6 +1074,7 @@ def init_gpio():
         state.gpio_safety_line = None
         state.gpio_chip = None
         state.gpio_chip_id = None
+        state.gpio_edge_mode = False
 
     # Build ordered list of libraries to attempt.
     # Preferred library first, then fallback.
@@ -974,19 +1098,23 @@ def init_gpio():
             if lib == 'gpiod':
                 for chip_id in _gpiochip_candidates():
                     try:
-                        state.gpio_chip, opened_line = _open_gpiod_line(chip_id)
+                        state.gpio_chip, opened_line, edge_mode = _open_gpiod_line(chip_id)
                         if isinstance(opened_line, tuple):
                             state.gpio_line, state.gpio_safety_line = opened_line
                         else:
                             state.gpio_line = opened_line
                             state.gpio_safety_line = None
+                        state.gpio_edge_mode = edge_mode
                         state.gpio_ready = True
                         state.gpio_chip_id = chip_id
                         GPIO_LIB = 'gpiod'
                         _gpio_init_failure_logged = False
                         event_log.add(
                             'gpio',
-                            f"GPIO initialized (gpiod) - {chip_id} pin {config.CONTACT_PIN} with pull-up",
+                            f"GPIO initialized (gpiod) - {chip_id} pin {config.CONTACT_PIN} "
+                            f"with pull-up"
+                            + (" - kernel edge detection active" if edge_mode
+                               else " - polling mode"),
                         )
                         return True
                     except Exception as e:
@@ -996,6 +1124,7 @@ def init_gpio():
                 for chip_id in _gpiochip_candidates():
                     try:
                         state.gpio_chip = _open_lgpio_line(chip_id)
+                        state.gpio_edge_mode = False
                         state.gpio_ready = True
                         state.gpio_chip_id = chip_id
                         GPIO_LIB = 'lgpio'
@@ -1195,6 +1324,7 @@ def api_status():
         'gpio_ready': state.gpio_ready,
         'gpio_lib': GPIO_LIB if state.gpio_ready else None,
         'gpio_chip': str(state.gpio_chip_id) if state.gpio_chip_id is not None else None,
+        'gpio_edge_mode': state.gpio_edge_mode,
         'gpio_chip_setting': str(config.GPIO_CHIP) if config.GPIO_CHIP is not None else None,
         'contact_pin': config.CONTACT_PIN,
         'safety_switch_pin': config.SAFETY_SWITCH_PIN,
@@ -1472,12 +1602,68 @@ def gpio_fire_level():
     return 0 if config.TRIGGER_ON == 'close' else 1
 
 
+def _apply_contact_event(evt, now, trigger_ctx):
+    """Handle one debounced contact-line event (shared by both monitor modes)."""
+    if evt['kind'] == 'glitch':
+        state.glitch_trackers['contact'].record(evt, now)
+        return
+    if evt['from'] is None:
+        event_log.add('contact', f"Contact line is {_level_text(evt['to'])} at startup")
+        return
+    event_log.add(
+        'contact',
+        f"Contact {_level_text(evt['to'])} "
+        f"(was {_level_text(evt['from'])} for {_fmt_duration(evt['prev_duration'])})",
+    )
+    if evt['to'] == gpio_fire_level():
+        last = trigger_ctx.get('last_trigger_time')
+        if last is None or (now - last) >= config.DEBOUNCE_TIME:
+            trigger_ctx['last_trigger_time'] = now
+            trigger_sequence(source='gpio')
+        else:
+            event_log.add('trigger', "GPIO trigger suppressed (cooldown active)")
+
+
+def _apply_safety_event(evt, now):
+    """Handle one debounced safety-line event (shared by both monitor modes)."""
+    if evt['kind'] == 'glitch':
+        state.glitch_trackers['safety'].record(evt, now)
+        return
+    if evt['from'] is None:
+        event_log.add(
+            'safety',
+            f"Safety switch is {'ON' if evt['to'] == 0 else 'OFF'} at startup",
+        )
+        return
+    if evt['to'] == 1:
+        event_log.add('safety', "Safety switch turned OFF")
+        if config.SAFETY_SWITCH_ENABLED:
+            event_log.add('safety', "Forcing Scene A (safety lockout)")
+            with state.timer_lock:
+                if state.scene_b_timer is not None:
+                    state.scene_b_timer.cancel()
+                    state.scene_b_timer = None
+            apply_scene('scene_a')
+    else:
+        event_log.add('safety', "Safety switch turned ON")
+
+
 def _gpio_monitor():
-    """Background thread: samples both GPIO lines, debounces them, and
-    fires the trigger sequence on the configured contact transition."""
+    """Background thread: watches both GPIO lines and fires the trigger
+    sequence on the configured contact transition.
+
+    Two modes, selected at init time:
+    - Kernel edge detection (gpiod v2): the kernel latches every edge
+      with exact timestamps, so arbitrarily short trigger pulses are
+      never missed and glitch widths are measured precisely.
+    - Polling fallback (gpiod v1 / lgpio): samples every
+      GPIO_POLL_INTERVAL with the same debounce semantics.
+    """
     contact = LineMonitor('contact', config.TRIGGER_HOLD_TIME)
     safety = LineMonitor('safety', config.TRIGGER_HOLD_TIME)
-    last_trigger_time = None
+    e_contact = EdgeDebouncer('contact', config.TRIGGER_HOLD_TIME)
+    e_safety = EdgeDebouncer('safety', config.TRIGGER_HOLD_TIME)
+    trigger_ctx = {'last_trigger_time': None}
     last_good_read = None
     consecutive_errors = 0
     max_errors_before_reinit = 3
@@ -1488,7 +1674,18 @@ def _gpio_monitor():
                 if init_gpio():
                     contact.reset()
                     safety.reset()
+                    e_contact.reset()
+                    e_safety.reset()
                     last_good_read = None
+                    if state.gpio_edge_mode:
+                        # Latch startup baselines from a direct read.
+                        now = time.monotonic()
+                        evt = e_contact.seed(check_contact_state(), now)
+                        if evt is not None:
+                            _apply_contact_event(evt, now, trigger_ctx)
+                        evt = e_safety.seed(check_safety_switch_state(), now)
+                        if evt is not None:
+                            _apply_safety_event(evt, now)
                 else:
                     time.sleep(5.0)
                     continue
@@ -1496,9 +1693,36 @@ def _gpio_monitor():
             # Pick up runtime config changes made from the web UI. The
             # safety toggle keeps a stability floor so a near-zero glitch
             # filter can't make the lockout flap on switch bounce.
-            contact.stable_time = config.TRIGGER_HOLD_TIME
-            safety.stable_time = max(config.TRIGGER_HOLD_TIME, config.SAFETY_STABLE_TIME_MIN)
+            safety_stable = max(config.TRIGGER_HOLD_TIME, config.SAFETY_STABLE_TIME_MIN)
+            contact.stable_time = e_contact.stable_time = config.TRIGGER_HOLD_TIME
+            safety.stable_time = e_safety.stable_time = safety_stable
 
+            if state.gpio_edge_mode:
+                # --- kernel edge-event mode ---
+                have_events = state.gpio_line.wait_edge_events(0.02)
+                now = time.monotonic()
+                if have_events:
+                    for ev in state.gpio_line.read_edge_events():
+                        level = 1 if ev.event_type == gpiod.EdgeEvent.Type.RISING_EDGE else 0
+                        ts = ev.timestamp_ns / 1e9
+                        if ev.line_offset == config.CONTACT_PIN:
+                            for evt in e_contact.edge(level, ts):
+                                _apply_contact_event(evt, now, trigger_ctx)
+                        else:
+                            for evt in e_safety.edge(level, ts):
+                                _apply_safety_event(evt, now)
+                evt = e_contact.tick(now)
+                if evt is not None:
+                    _apply_contact_event(evt, now, trigger_ctx)
+                evt = e_safety.tick(now)
+                if evt is not None:
+                    _apply_safety_event(evt, now)
+                for tracker in state.glitch_trackers.values():
+                    tracker.flush(now)
+                consecutive_errors = 0
+                continue
+
+            # --- polling fallback mode ---
             now = time.monotonic()
             contact_level = check_contact_state()
             safety_level = check_safety_switch_state()
@@ -1517,51 +1741,13 @@ def _gpio_monitor():
             else:
                 last_good_read = now
 
-            transition = contact.sample(contact_level, now)
-            if transition is not None:
-                if transition['kind'] == 'glitch':
-                    state.glitch_trackers['contact'].record(transition, now)
-                elif transition['from'] is None:
-                    event_log.add(
-                        'contact',
-                        f"Contact line is {_level_text(transition['to'])} at startup",
-                    )
-                else:
-                    event_log.add(
-                        'contact',
-                        f"Contact {_level_text(transition['to'])} "
-                        f"(was {_level_text(transition['from'])} for "
-                        f"{_fmt_duration(transition['prev_duration'])})",
-                    )
-                    if transition['to'] == gpio_fire_level():
-                        if (last_trigger_time is None
-                                or (now - last_trigger_time) >= config.DEBOUNCE_TIME):
-                            last_trigger_time = now
-                            trigger_sequence(source='gpio')
-                        else:
-                            event_log.add('trigger', "GPIO trigger suppressed (cooldown active)")
+            evt = contact.sample(contact_level, now)
+            if evt is not None:
+                _apply_contact_event(evt, now, trigger_ctx)
 
-            safety_transition = safety.sample(safety_level, now)
-            if safety_transition is not None:
-                if safety_transition['kind'] == 'glitch':
-                    state.glitch_trackers['safety'].record(safety_transition, now)
-                elif safety_transition['from'] is None:
-                    event_log.add(
-                        'safety',
-                        "Safety switch is "
-                        f"{'ON' if safety_transition['to'] == 0 else 'OFF'} at startup",
-                    )
-                elif safety_transition['to'] == 1:
-                    event_log.add('safety', "Safety switch turned OFF")
-                    if config.SAFETY_SWITCH_ENABLED:
-                        event_log.add('safety', "Forcing Scene A (safety lockout)")
-                        with state.timer_lock:
-                            if state.scene_b_timer is not None:
-                                state.scene_b_timer.cancel()
-                                state.scene_b_timer = None
-                        apply_scene('scene_a')
-                else:
-                    event_log.add('safety', "Safety switch turned ON")
+            evt = safety.sample(safety_level, now)
+            if evt is not None:
+                _apply_safety_event(evt, now)
 
             for tracker in state.glitch_trackers.values():
                 tracker.flush(now)
