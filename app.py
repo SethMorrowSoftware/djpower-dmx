@@ -988,6 +988,12 @@ class BurstDetector:
     seconds at idle, so one actuation fires exactly once.
     """
 
+    # After this long continuously at a non-idle level, that level IS the
+    # new idle (e.g. wiring repaired, line now rests differently). Prevents
+    # a permanent level shift from counting as signal forever, and lets the
+    # detector re-arm from the new resting state.
+    REBASE_TIME = 5.0  # seconds
+
     def __init__(self, high_time, window, quiet_rearm):
         self.high_time = high_time
         self.window = window
@@ -995,17 +1001,36 @@ class BurstDetector:
         self.reset()
 
     def reset(self):
+        self._idle = None          # own idle reference, latched via seed()
+        self._level = None         # last seen raw level
+        self._level_since = None   # when the current raw level began
         self._intervals = deque()  # closed (start, end) spans away from idle
         self._away_since = None
         self._last_activity = None
         self._armed = True
 
-    def idle_changed(self):
-        """The debounced idle level moved (real committed transition) —
-        discard accumulation so the new steady state isn't counted as
-        signal against itself."""
+    @property
+    def seeded(self):
+        return self._idle is not None
+
+    def seed(self, level, now):
+        """Latch the initial idle reference from a direct line read."""
+        if level is None:
+            return
+        self._idle = level
+        self._level = level
+        self._level_since = now
+
+    def resync(self, level, now):
+        """Discard accumulation after kernel event loss; keep idle/armed."""
+        if level is None:
+            return
+        if self._idle is None:
+            self._idle = level
+        self._level = level
+        self._level_since = now
         self._intervals.clear()
-        self._away_since = None
+        self._away_since = None if level == self._idle else now
 
     def _accumulated(self, now):
         cutoff = now - self.window
@@ -1013,29 +1038,49 @@ class BurstDetector:
             self._intervals.popleft()
         total = sum(end - max(start, cutoff) for start, end in self._intervals)
         if self._away_since is not None:
-            total += now - max(self._away_since, cutoff)
+            # max() guards against an edge timestamp slightly newer than a
+            # tick's 'now' (loop latency) producing negative mass.
+            total += max(0.0, now - max(self._away_since, cutoff))
         return total
 
-    def ingest(self, level, ts, idle_level):
-        """Feed one kernel edge (level after the edge). Returns fire info
-        or None. idle_level is the line's current debounced level."""
-        if idle_level is None:
+    def ingest(self, level, ts):
+        """Feed one kernel edge (level after the edge). Returns an event
+        dict ({'kind': 'fire' | 'rebase', ...}) or None.
+
+        The idle reference is managed internally (seeded once, then only
+        moved by REBASE_TIME of sustained change) — deliberately NOT tied
+        to the user-tunable glitch-filter debouncer, whose commits would
+        otherwise erase legitimately accumulated signal mass.
+        """
+        if self._idle is None:
             return None
-        self._last_activity = ts
-        if level != idle_level:
-            if self._away_since is None:
-                self._away_since = ts
-        else:
-            if self._away_since is not None:
-                self._intervals.append((self._away_since, ts))
-                self._away_since = None
+        if level != self._level:
+            self._level = level
+            self._level_since = ts
+            self._last_activity = ts
+            if level != self._idle:
+                if self._away_since is None:
+                    self._away_since = ts
+            else:
+                if self._away_since is not None:
+                    self._intervals.append((self._away_since, ts))
+                    self._away_since = None
         return self._evaluate(ts)
 
-    def tick(self, now, idle_level):
+    def tick(self, now):
         """Periodic check: a still-open excursion (line parked away from
-        idle) accumulates between edges and can cross the threshold."""
-        if idle_level is None:
+        idle) accumulates between edges and can cross the threshold; a
+        very long-parked level becomes the new idle instead."""
+        if self._idle is None:
             return None
+        if (self._level is not None and self._level != self._idle
+                and self._level_since is not None
+                and (now - self._level_since) >= self.REBASE_TIME):
+            self._idle = self._level
+            self._intervals.clear()
+            self._away_since = None
+            self._armed = True
+            return {'kind': 'rebase', 'idle': self._idle, 'at': now}
         return self._evaluate(now)
 
     def _evaluate(self, now):
@@ -1043,8 +1088,8 @@ class BurstDetector:
         if self._armed:
             if acc >= self.high_time:
                 self._armed = False
-                return {'high_ms': acc * 1000.0, 'window_ms': self.window * 1000.0,
-                        'at': now}
+                return {'kind': 'fire', 'high_ms': acc * 1000.0,
+                        'window_ms': self.window * 1000.0, 'at': now}
         elif (self._away_since is None
                 and self._last_activity is not None
                 and (now - self._last_activity) >= self.quiet_rearm):
@@ -1121,7 +1166,7 @@ def _open_gpiod_line(chip_id):
                         config.CONTACT_PIN: line_settings,
                         config.SAFETY_SWITCH_PIN: line_settings,
                     },
-                    event_buffer_size=64,
+                    event_buffer_size=1024,  # kernel cap; shared by both lines
                 )
                 if hasattr(request, "read_edge_events") and hasattr(request, "wait_edge_events"):
                     return None, request, True
@@ -1861,6 +1906,7 @@ def _gpio_monitor():
     consecutive_errors = 0
     max_errors_before_reinit = 3
     edge_seeded = False
+    edge_seqno = {}  # per-offset expected next line_seqno (overflow detection)
     burst_fallback_warned = False
 
     while True:
@@ -1874,6 +1920,7 @@ def _gpio_monitor():
                     burst.reset()
                     last_good_read = None
                     edge_seeded = False
+                    edge_seqno = {}
                     burst_fallback_warned = False
                 else:
                     time.sleep(5.0)
@@ -1882,16 +1929,24 @@ def _gpio_monitor():
             # Latch startup baselines from a direct read. GPIO is usually
             # initialized by _initialize() before this thread starts, so
             # seeding must happen here on the first pass, not only after a
-            # monitor-driven re-init.
+            # monitor-driven re-init. A failed (None) read is retried on
+            # subsequent iterations — otherwise the first real transition
+            # would be swallowed as a baseline.
             if state.gpio_edge_mode and not edge_seeded:
-                edge_seeded = True
                 now = time.monotonic()
-                evt = e_contact.seed(check_contact_state(), now)
-                if evt is not None:
-                    _apply_contact_event(evt, now, trigger_ctx)
-                evt = e_safety.seed(check_safety_switch_state(), now)
-                if evt is not None:
-                    _apply_safety_event(evt, now)
+                if e_contact.stable_level is None:
+                    evt = e_contact.seed(check_contact_state(), now)
+                    if evt is not None:
+                        _apply_contact_event(evt, now, trigger_ctx)
+                if e_safety.stable_level is None:
+                    evt = e_safety.seed(check_safety_switch_state(), now)
+                    if evt is not None:
+                        _apply_safety_event(evt, now)
+                if not burst.seeded:
+                    burst.seed(check_contact_state(), now)
+                edge_seeded = (e_contact.stable_level is not None
+                               and e_safety.stable_level is not None
+                               and burst.seeded)
 
             # Pick up runtime config changes made from the web UI. The
             # safety toggle keeps a stability floor so a near-zero glitch
@@ -1915,39 +1970,78 @@ def _gpio_monitor():
                 burst.window = config.BURST_WINDOW
                 burst.quiet_rearm = config.BURST_QUIET_REARM
 
-                def _burst_fire(hit, now):
-                    _fire_gpio_trigger(
-                        now, trigger_ctx,
-                        detail=(f"Signal burst: {hit['high_ms']:.1f}ms away from idle "
-                                f"within {hit['window_ms']:.0f}ms window"),
-                    )
+                def _burst_event(hit, now):
+                    if hit['kind'] == 'rebase':
+                        event_log.add(
+                            'contact',
+                            f"Burst idle re-latched to {_level_text(hit['idle'])} "
+                            f"(line settled there for {BurstDetector.REBASE_TIME:g}s)",
+                        )
+                    elif burst_mode:
+                        # Cooldown compared on the kernel-timestamp base so a
+                        # backlogged batch cannot collapse distinct fires.
+                        _fire_gpio_trigger(
+                            hit['at'], trigger_ctx,
+                            detail=(f"Signal burst: {hit['high_ms']:.1f}ms away from idle "
+                                    f"within {hit['window_ms']:.0f}ms window"),
+                        )
+
+                # Snapshot pin routing for this batch: a concurrent pin
+                # reassignment from the web UI must not route old-pin edges
+                # into the safety handler.
+                contact_pin = config.CONTACT_PIN
+                safety_pin = config.SAFETY_SWITCH_PIN
 
                 have_events = state.gpio_line.wait_edge_events(0.02)
                 now = time.monotonic()
+                overflow_detected = False
                 if have_events:
                     for ev in state.gpio_line.read_edge_events():
+                        # Kernel buffer overflow silently drops the OLDEST
+                        # events; the only userspace trace is a line_seqno gap.
+                        seq = getattr(ev, 'line_seqno', None)
+                        if seq is not None:
+                            expected = edge_seqno.get(ev.line_offset)
+                            if expected is not None and seq != expected:
+                                overflow_detected = True
+                            edge_seqno[ev.line_offset] = seq + 1
                         level = 1 if ev.event_type == gpiod.EdgeEvent.Type.RISING_EDGE else 0
                         ts = ev.timestamp_ns / 1e9
-                        if ev.line_offset == config.CONTACT_PIN:
-                            hit = burst.ingest(level, ts, e_contact.stable_level)
-                            if burst_mode and hit is not None:
-                                _burst_fire(hit, now)
+                        if ev.line_offset == contact_pin:
+                            hit = burst.ingest(level, ts)
+                            if hit is not None:
+                                _burst_event(hit, now)
                             for evt in e_contact.edge(level, ts):
-                                if evt['kind'] == 'transition':
-                                    burst.idle_changed()
-                                _apply_contact_event(evt, now, trigger_ctx,
+                                _apply_contact_event(evt, evt.get('at', now), trigger_ctx,
                                                      fire=not burst_mode)
-                        else:
+                        elif ev.line_offset == safety_pin:
                             for evt in e_safety.edge(level, ts):
                                 _apply_safety_event(evt, now)
-                hit = burst.tick(now, e_contact.stable_level)
-                if burst_mode and hit is not None:
-                    _burst_fire(hit, now)
+
+                if overflow_detected:
+                    # Events were lost: debounced state may be desynced from
+                    # the real line. Re-baseline everything from direct reads.
+                    event_log.add(
+                        'gpio',
+                        "Kernel edge-event buffer overflow detected (events dropped) "
+                        "- resyncing line state from direct reads",
+                    )
+                    resync_now = time.monotonic()
+                    contact_level = check_contact_state()
+                    safety_level = check_safety_switch_state()
+                    e_contact.reset()
+                    e_contact.seed(contact_level, resync_now)
+                    e_safety.reset()
+                    e_safety.seed(safety_level, resync_now)
+                    burst.resync(contact_level, resync_now)
+
+                hit = burst.tick(now)
+                if hit is not None:
+                    _burst_event(hit, now)
                 evt = e_contact.tick(now)
                 if evt is not None:
-                    if evt['kind'] == 'transition':
-                        burst.idle_changed()
-                    _apply_contact_event(evt, now, trigger_ctx, fire=not burst_mode)
+                    _apply_contact_event(evt, evt.get('at', now), trigger_ctx,
+                                         fire=not burst_mode)
                 evt = e_safety.tick(now)
                 if evt is not None:
                     _apply_safety_event(evt, now)
