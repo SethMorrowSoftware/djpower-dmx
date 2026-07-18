@@ -25,7 +25,7 @@ COOLDOWN = 0.3
 
 
 def simulate(pulses, trigger_on, duration=4.0, offset=0.0,
-             hold=HOLD, cooldown=COOLDOWN, none_windows=()):
+             hold=HOLD, cooldown=COOLDOWN, none_windows=(), poll=POLL):
     """Replicate the monitor loop's trigger decision over a waveform.
 
     pulses: list of (start, length) intervals where the line reads LOW (0);
@@ -60,7 +60,7 @@ def simulate(pulses, trigger_on, duration=4.0, offset=0.0,
                     if last_trigger_time is None or (t - last_trigger_time) >= cooldown:
                         last_trigger_time = t
                         triggers.append(round(t, 4))
-        t = round(t + POLL, 6)
+        t = round(t + poll, 6)
     return triggers, transitions, baseline, glitches
 
 
@@ -160,8 +160,32 @@ check("800ms hold rejects 300ms press (old behavior reproducible)",
 check("800ms hold accepts 1s press",
       sweep([(2.0, 1.0)], 'close', hold=0.8) == {1})
 
+print("Short-pulse triggers (the ~10ms field case):")
+# Production config: 5ms poll. A 10ms HIGH pulse on an inverted (idles LOW)
+# line with a 5ms filter must fire on every alignment.
+check("10ms pulse fires with 5ms filter at 5ms poll (inverted wiring)",
+      sweep(inverted([(1.0, 0.010)]), 'open', hold=0.005, poll=0.005) == {1})
+check("10ms pulse rejected by 50ms filter (the reported bug)",
+      sweep(inverted([(1.0, 0.010)]), 'open', hold=0.05, poll=0.005) == {0})
+check("sub-5ms spike still rejected with 5ms filter",
+      sweep(inverted([(1.0, 0.002)]), 'open', hold=0.005, poll=0.005) == {0})
+check("two 10ms pulses 1s apart fire twice (5ms filter)",
+      sweep(inverted([(1.0, 0.010), (2.0, 0.010)]), 'open',
+            hold=0.005, poll=0.005) == {2})
+
+print("Zero filter (single-sample edge latch):")
+check("10ms pulse always fires with 0 filter at 10ms poll",
+      sweep([(0.5, 0.010)], 'close', hold=0.0) <= {1} and
+      1 in sweep([(0.5, 0.010)], 'close', hold=0.0))
+check("12ms pulse fires exactly once with 0 filter",
+      sweep([(0.5, 0.012)], 'close', hold=0.0) == {1})
+check("boot with line LOW and 0 filter still never self-fires",
+      sweep(inverted([]), 'open', hold=0.0) == {0} and
+      sweep(inverted([]), 'close', hold=0.0) == {0})
+
 print("Config clamps:")
-check("hold time clamps low", app._clamp_hold_time(0.0001) == 0.02)
+check("hold time clamps low (0 allowed)", app._clamp_hold_time(-1) == 0.0)
+check("hold time zero passes through", app._clamp_hold_time(0.0) == 0.0)
 check("hold time clamps high", app._clamp_hold_time(99) == 2.0)
 check("debounce clamps low", app._clamp_debounce_time(-5) == 0.0)
 check("debounce clamps high", app._clamp_debounce_time(999) == 30.0)
