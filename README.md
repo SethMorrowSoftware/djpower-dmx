@@ -409,6 +409,8 @@ The **GPIO Trigger & Diagnostics** card in the web UI shows the live raw level o
 
 **Trigger config keys** (`POST /api/config`, persisted to disk): `trigger_on` (`"close"`/`"open"`), `trigger_hold_time` (seconds, clamped 0.02–2.0), `debounce_time` (seconds, clamped 0–30), `safety_switch_enabled` (bool).
 
+**GPIO assignment keys** (also persisted, applied immediately via GPIO re-init): `contact_pin` and `safety_switch_pin` (BCM numbers 2–27, must differ — send both together), `gpio_chip` (`"auto"` to scan all chips, or a chip index / `gpiochipN` name to force one — e.g. `gpiochip4` on Pi 5 kernels older than ~6.6.47 where the header chip is not `gpiochip0`). The same settings are editable in the diagnostics card; the event log records the re-init outcome so a bad pin choice is immediately visible and reversible from the UI.
+
 ### Tests
 
 The trigger engine has a dependency-free test suite that simulates realistic waveforms (button presses, relay pulses, EMI glitches, inverted wiring, boot states, read failures) across every poll alignment:

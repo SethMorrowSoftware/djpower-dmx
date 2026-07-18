@@ -170,6 +170,30 @@ for bad in (float('nan'),):
         passed += 1
         print("  ok - NaN rejected by clamp")
 
+print("Pin/chip validation:")
+check("pin 17 valid", app._validate_bcm_pin(17) == 17)
+check("pin string '5' valid", app._validate_bcm_pin("5") == 5)
+for bad in (0, 1, 28, -3, "x", None):
+    try:
+        app._validate_bcm_pin(bad)
+        raise AssertionError(f"FAIL: pin {bad!r} accepted")
+    except (TypeError, ValueError):
+        passed += 1
+        print(f"  ok - pin {bad!r} rejected")
+check("chip 'auto' -> None", app._normalize_gpio_chip_setting('auto') is None)
+check("chip '' -> None", app._normalize_gpio_chip_setting('') is None)
+check("chip None -> None", app._normalize_gpio_chip_setting(None) is None)
+check("chip '4' -> 4", app._normalize_gpio_chip_setting('4') == 4)
+check("chip 'gpiochip4' passes", app._normalize_gpio_chip_setting('gpiochip4') == 'gpiochip4')
+check("chip '/dev/gpiochip0' passes",
+      app._normalize_gpio_chip_setting('/dev/gpiochip0') == '/dev/gpiochip0')
+try:
+    app._normalize_gpio_chip_setting('bogus')
+    raise AssertionError("FAIL: bogus chip accepted")
+except ValueError:
+    passed += 1
+    print("  ok - bogus chip name rejected")
+
 print("Event log:")
 log = app.EventLog(maxlen=3)
 for i in range(5):

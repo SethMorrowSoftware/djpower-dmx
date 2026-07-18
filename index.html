@@ -213,7 +213,8 @@
             box-shadow: 0 2px 8px rgba(59, 130, 246, 0.5);
         }
         
-        input[type="number"] {
+        input[type="number"],
+        input[type="text"] {
             width: 100%;
             padding: 12px 14px;
             border: 1px solid #3f3f46;
@@ -223,8 +224,9 @@
             color: #e4e4e7;
             transition: all 0.2s;
         }
-        
-        input[type="number"]:focus {
+
+        input[type="number"]:focus,
+        input[type="text"]:focus {
             outline: none;
             border-color: #3b82f6;
             box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
@@ -409,7 +411,7 @@
             border: 1px solid #2a2a3a;
             border-radius: 8px;
             padding: 10px 12px;
-            max-height: 220px;
+            max-height: 420px;
             overflow-y: auto;
             font-family: 'SF Mono', 'Consolas', monospace;
             font-size: 12px;
@@ -544,11 +546,11 @@
 
             <div class="status-grid">
                 <div class="status-item">
-                    <div class="status-label">Contact Line (GPIO 17)</div>
+                    <div class="status-label" id="diag-contact-label">Contact Line (GPIO 17)</div>
                     <div class="status-value" id="diag-contact" style="font-size: 14px; padding-top: 3px;">—</div>
                 </div>
                 <div class="status-item">
-                    <div class="status-label">Safety Line (GPIO 27)</div>
+                    <div class="status-label" id="diag-safety-label">Safety Line (GPIO 27)</div>
                     <div class="status-value" id="diag-safety" style="font-size: 14px; padding-top: 3px;">—</div>
                 </div>
                 <div class="status-item">
@@ -590,13 +592,36 @@
             <div class="toggle-row">
                 <input type="checkbox" id="safety-enabled" checked onchange="toggleSafetyInterlock(this)"
                        style="width: 18px; height: 18px; accent-color: #3b82f6; cursor: pointer;">
-                <label for="safety-enabled" style="margin-bottom: 0; cursor: pointer;">
+                <label for="safety-enabled" id="safety-enabled-label" style="margin-bottom: 0; cursor: pointer;">
                     Hardware safety-switch interlock (GPIO 27)
                 </label>
             </div>
             <div class="diag-hint">
                 When disabled, the controller operates as if the safety switch were ON.
-                Disable only if pin 27 is not wired to a real switch.
+                Disable only if the safety pin is not wired to a real switch.
+            </div>
+
+            <div class="inline-controls" style="margin-top: 16px;">
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label for="contact-pin">Contact Pin (BCM)</label>
+                    <input type="number" id="contact-pin" min="2" max="27" step="1" value="17">
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label for="safety-pin">Safety Pin (BCM)</label>
+                    <input type="number" id="safety-pin" min="2" max="27" step="1" value="27">
+                </div>
+                <div class="form-group" style="margin-bottom: 0;">
+                    <label for="gpio-chip">GPIO Chip</label>
+                    <input type="text" id="gpio-chip" placeholder="auto">
+                </div>
+                <button class="btn-secondary" onclick="saveGpioPins()" style="height: 46px;">
+                    Apply Pin Settings
+                </button>
+            </div>
+            <div class="diag-hint">
+                BCM numbering (GPIO 17 = physical pin 11). Changing pins or chip re-initializes
+                GPIO immediately — watch the event log for the result. Leave chip on "auto"
+                unless the header chip must be forced (e.g. gpiochip4 on some Pi 5 kernels).
             </div>
 
             <div class="form-group" style="margin-top: 16px; margin-bottom: 0;">
@@ -849,6 +874,26 @@
                 document.getElementById('safety-enabled').checked = data.safety_switch_enabled;
             }
 
+            // Pin assignment widgets and tile labels
+            if (data.contact_pin !== undefined) {
+                document.getElementById('diag-contact-label').textContent =
+                    'Contact Line (GPIO ' + data.contact_pin + ')';
+                const pinEl = document.getElementById('contact-pin');
+                if (document.activeElement !== pinEl) pinEl.value = data.contact_pin;
+            }
+            if (data.safety_switch_pin !== undefined) {
+                document.getElementById('diag-safety-label').textContent =
+                    'Safety Line (GPIO ' + data.safety_switch_pin + ')';
+                document.getElementById('safety-enabled-label').textContent =
+                    'Hardware safety-switch interlock (GPIO ' + data.safety_switch_pin + ')';
+                const pinEl = document.getElementById('safety-pin');
+                if (document.activeElement !== pinEl) pinEl.value = data.safety_switch_pin;
+            }
+            const chipEl = document.getElementById('gpio-chip');
+            if (document.activeElement !== chipEl) {
+                chipEl.value = data.gpio_chip_setting || '';
+            }
+
             // Plain-language explanation of the current trigger config,
             // including a warning when the line is parked at the firing level.
             const firing = data.trigger_on === 'open' ? 'open' : 'closed';
@@ -882,6 +927,40 @@
             .catch(error => {
                 console.error('Error:', error);
                 showToast(`❌ ${error.message || 'Error saving trigger settings'}`, true);
+            });
+        }
+
+        function saveGpioPins() {
+            const contactPin = parseInt(document.getElementById('contact-pin').value);
+            const safetyPin = parseInt(document.getElementById('safety-pin').value);
+            const chip = document.getElementById('gpio-chip').value.trim();
+            if (!confirm(
+                    'Apply GPIO pin settings?\n\n' +
+                    'Contact pin: BCM ' + contactPin + '\n' +
+                    'Safety pin: BCM ' + safetyPin + '\n' +
+                    'Chip: ' + (chip || 'auto') + '\n\n' +
+                    'GPIO re-initializes immediately with the new settings.')) {
+                return;
+            }
+            fetch('/api/config', {
+                method: 'POST',
+                headers: getApiHeaders(),
+                body: JSON.stringify({
+                    contact_pin: contactPin,
+                    safety_switch_pin: safetyPin,
+                    gpio_chip: chip || 'auto',
+                })
+            })
+            .then(response => response.json().then(data => ({ok: response.ok, data})))
+            .then(({ok, data}) => {
+                if (!ok) throw new Error(data.error || 'Save failed');
+                showToast('✅ GPIO pin settings applied');
+                updateStatus();
+                updateEvents();
+            })
+            .catch(error => {
+                console.error('Error:', error);
+                showToast(`❌ ${error.message || 'Error applying pin settings'}`, true);
             });
         }
 
