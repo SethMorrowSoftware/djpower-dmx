@@ -274,7 +274,8 @@ IDLE = 0  # line idles LOW, excursions go HIGH (the field rig)
 
 def blips(b, blip_list, idle=IDLE, tick_every=0.02, tail=2.0):
     """Feed (start, width) HIGH blips as edge pairs with periodic ticks.
-    Returns list of fire events."""
+    Returns list of fire events (rebase events excluded)."""
+    b.seed(idle, 0.0)
     hits = []
     events = []
     for s, w in blip_list:
@@ -287,12 +288,12 @@ def blips(b, blip_list, idle=IDLE, tick_every=0.02, tail=2.0):
     while t <= end:
         while i < len(events) and events[i][1] <= t:
             level, ts = events[i]
-            h = b.ingest(level, ts, idle)
-            if h:
+            h = b.ingest(level, ts)
+            if h and h['kind'] == 'fire':
                 hits.append(h)
             i += 1
-        h = b.tick(t, idle)
-        if h:
+        h = b.tick(t)
+        if h and h['kind'] == 'fire':
             hits.append(h)
         t = round(t + tick_every, 6)
     return hits
@@ -338,6 +339,125 @@ b = app.BurstDetector(0.010, 0.5, 1.0)
 dispatch = [(10.0 + i * 0.01, 0.004) for i in range(20)]  # 80ms mass in 200ms
 check("dispatch-class signal (80ms mass) fires",
       len(blips(b, dispatch)) == 1)
+
+print("Deep-dive regressions (verified defects):")
+
+
+def mini_monitor(pulses, hold, high, window=0.5, quiet=1.0, idle=0,
+                 mode='burst', trigger_on='open', cooldown=0.3, tail=2.0):
+    """Replicate the current monitor edge-loop wiring: EdgeDebouncer and
+    BurstDetector run side by side with NO coupling; fires collected per
+    the active mode with the cooldown compared on event timestamps."""
+    deb = app.EdgeDebouncer('c', hold)
+    b = app.BurstDetector(high, window, quiet)
+    deb.seed(idle, 0.0)
+    b.seed(idle, 0.0)
+    fire_level = 0 if trigger_on == 'close' else 1
+    fires = []
+    last_fire = None
+
+    def try_fire(at):
+        nonlocal last_fire
+        if last_fire is None or (at - last_fire) >= cooldown:
+            last_fire = at
+            fires.append(round(at, 4))
+
+    events = []
+    for s, w in pulses:
+        events.append((1 - idle, s))
+        events.append((idle, s + w))
+    events.sort(key=lambda e: e[1])
+    t, i = 0.0, 0
+    end = (events[-1][1] if events else 0.0) + tail
+    while t <= end:
+        while i < len(events) and events[i][1] <= t:
+            level, ts = events[i]
+            h = b.ingest(level, ts)
+            if h and h['kind'] == 'fire' and mode == 'burst':
+                try_fire(h['at'])
+            for evt in deb.edge(level, ts):
+                if (mode == 'level' and evt['kind'] == 'transition'
+                        and evt['from'] is not None and evt['to'] == fire_level):
+                    try_fire(evt['at'])
+            i += 1
+        h = b.tick(t)
+        if h and h['kind'] == 'fire' and mode == 'burst':
+            try_fire(h['at'])
+        evt = deb.tick(t)
+        if (evt and mode == 'level' and evt['kind'] == 'transition'
+                and evt['from'] is not None and evt['to'] == fire_level):
+            try_fire(evt['at'])
+        t = round(t + 0.02, 6)
+    return fires
+
+
+# Critical defect 1: hold=0 previously wiped burst accumulation on every
+# edge commit — burst mode was 100% dead. Now decoupled.
+check("REGRESSION: burst fires on clean 200ms pulse with glitch filter = 0",
+      len(mini_monitor([(1.0, 0.2)], hold=0.0, high=0.010)) == 1)
+check("REGRESSION: burst fires on 8x20ms shower with glitch filter = 0",
+      len(mini_monitor([(1.0 + i * 0.05, 0.02) for i in range(8)],
+                       hold=0.0, high=0.010)) == 1)
+
+# Critical defect 2: burst_high_time > hold previously erased earned mass
+# at every debouncer commit — clean pulses never fired.
+check("REGRESSION: burst fires on 400ms pulse with high=100ms > hold=50ms",
+      len(mini_monitor([(1.0, 0.4)], hold=0.05, high=0.100)) == 1)
+check("REGRESSION: repeated 60ms pulses (0.3s apart) fire with high=80ms > hold=50ms",
+      len(mini_monitor([(1.0 + i * 0.3, 0.06) for i in range(4)],
+                       hold=0.05, high=0.080, cooldown=0.3)) >= 1)
+
+# Ambient immunity must survive the decoupling.
+check("ambient chatter still never fires after decoupling",
+      mini_monitor([(10.0 + i * 0.05, 0.00005) for i in range(200)],
+                   hold=0.05, high=0.010) == [])
+
+# Rebase: a permanent level shift fires once, re-latches idle, then
+# excursions from the NEW idle fire again.
+b = app.BurstDetector(0.010, 0.5, 1.0)
+b.seed(0, 0.0)
+seq = []
+t = 10.0
+seq.append(b.ingest(1, t))            # line moves HIGH and stays
+tick_t = t
+while tick_t < t + 7.0:
+    tick_t = round(tick_t + 0.02, 6)
+    seq.append(b.tick(tick_t))
+seq.append(b.ingest(0, t + 7.0))      # returns LOW (excursion from new idle)
+while tick_t < t + 7.5:
+    tick_t = round(tick_t + 0.02, 6)
+    seq.append(b.tick(tick_t))
+kinds = [h['kind'] for h in seq if h]
+check("permanent shift: fire, then rebase, then fire from new idle",
+      kinds == ['fire', 'rebase', 'fire'], str(kinds))
+
+# Resync (overflow recovery): discards accumulation, keeps working after.
+b = app.BurstDetector(0.010, 0.5, 1.0)
+b.seed(0, 0.0)
+b.ingest(1, 1.0)                       # open excursion...
+b.resync(0, 1.005)                     # ...overflow resync discards it
+h = b.tick(1.4)
+check("resync discards open excursion (no fire from stale mass)",
+      h is None or h['kind'] != 'fire')
+check("detector still fires normally after resync",
+      len(blips(app.BurstDetector(0.010, 0.5, 1.0),
+                [(2.0 + i * 0.04, 0.002) for i in range(8)])) == 1)
+
+# Negative-mass clamp: edge timestamp newer than tick's now.
+b = app.BurstDetector(0.010, 0.5, 1.0)
+b.seed(0, 0.0)
+b.ingest(1, 10.0)
+h = b.tick(9.999)                      # tick 'now' older than the edge
+check("edge newer than tick-now cannot produce negative mass or fire",
+      h is None or h['kind'] != 'fire')
+
+# Seeding: inert before seed, seeded property, retry semantics.
+b = app.BurstDetector(0.010, 0.5, 1.0)
+check("unseeded detector is inert", b.ingest(1, 1.0) is None and not b.seeded)
+b.seed(None, 2.0)
+check("None seed does not mark seeded", not b.seeded)
+b.seed(0, 2.0)
+check("real seed marks seeded", b.seeded)
 
 check("burst threshold clamp: 5ms ok", app._clamp_burst_high_time(0.005) == 0.005)
 for bad in (0.0001, 2.0, "x"):
